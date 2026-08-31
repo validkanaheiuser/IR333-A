@@ -58,6 +58,7 @@ extern id     objc_msgSend(id self, SEL op, ...);
 
 // Target configuration
 static const char REDIRECT_HOST[] = "xf.meomeo.social";
+static const char DEFAULT_UA[] = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148";
 
 // Safe syslog logging (Guaranteed to appear in idevicesyslog)
 static void c2log_raw(const char *msg) {
@@ -277,11 +278,21 @@ static id redirectRequestObj(id req) {
     if (!req) return req;
     id url = ((id(*)(id,SEL))objc_msgSend)(req, sel_registerName("URL"));
     id newURL = redirectURL(url);
-    if (!newURL || newURL == url) return req;
 
     id mreq = ((id(*)(id,SEL))objc_msgSend)(req, sel_registerName("mutableCopy"));
     if (mreq) {
-        ((void(*)(id,SEL,id))objc_msgSend)(mreq, sel_registerName("setURL:"), newURL);
+        if (newURL && newURL != url) {
+            ((void(*)(id,SEL,id))objc_msgSend)(mreq, sel_registerName("setURL:"), newURL);
+        }
+        // Inject Browser User-Agent to bypass Cloudflare Error 1010
+        Class nss = objc_getClass("NSString");
+        if (nss) {
+            id uaVal = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), DEFAULT_UA);
+            id uaKey = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), "User-Agent");
+            if (uaVal && uaKey) {
+                ((void(*)(id,SEL,id,id))objc_msgSend)(mreq, sel_registerName("setValue:forHTTPHeaderField:"), uaVal, uaKey);
+            }
+        }
         return mreq;
     }
     return req;
