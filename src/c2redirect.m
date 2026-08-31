@@ -1,7 +1,6 @@
 // ==============================================================================
 // XoaInfo C2 Redirect Tweak for RootHide / Dopamine
-// Intercepts and redirects all C2 network communications to a researcher-controlled server.
-// Hooks: Network.framework, libSystem DNS, Security.framework TLS, and Foundation ObjC.
+// STRICT TARGET FILTER: Only activates within com.ienthach.XoaInfo / XoaInfo binaries.
 // ==============================================================================
 
 #pragma clang diagnostic ignored "-Weverything"
@@ -23,6 +22,7 @@ typedef long          intptr_t;
 typedef unsigned long uintptr_t;
 
 // C library declarations
+extern const char *getprogname(void);
 extern size_t  strlen(const char *s);
 extern int     strcmp(const char *s1, const char *s2);
 extern int     strncmp(const char *s1, const char *s2, size_t n);
@@ -58,20 +58,17 @@ static const char REDIRECT_HOST[] = "xf.meomeo.social";
 // Safe logging
 static void c2log_raw(const char *msg) {
     if (!msg) return;
-    // 1. write to stderr (fd 2)
     size_t len = strlen(msg);
     write(2, msg, len);
     write(2, "\n", 1);
 
-    // 2. write to file in /tmp/c2redirect.log
-    int fd = open("/tmp/c2redirect.log", 0x0001 | 0x0008 | 0x0200, 0666); // O_WRONLY | O_APPEND | O_CREAT
+    int fd = open("/tmp/c2redirect.log", 0x0001 | 0x0008 | 0x0200, 0666);
     if (fd >= 0) {
         write(fd, msg, len);
         write(fd, "\n", 1);
         close(fd);
     }
 
-    // 3. NSLog
     Class nss = objc_getClass("NSString");
     if (nss) {
         id str = ((id(*)(id,SEL,const char*))objc_msgSend)(
@@ -102,6 +99,30 @@ static int is_xoainfo(const char *s) {
     return 0;
 }
 
+// Strict process check to protect SpringBoard and system daemons
+static int is_target_process(void) {
+    const char *prog = getprogname();
+    if (prog) {
+        if (strstr(prog, "XoaInfo") || strstr(prog, "xoainfo")) {
+            return 1;
+        }
+    }
+    Class nsb = objc_getClass("NSBundle");
+    if (nsb) {
+        id mainB = ((id(*)(id,SEL))objc_msgSend)((id)nsb, sel_registerName("mainBundle"));
+        if (mainB) {
+            id bid = ((id(*)(id,SEL))objc_msgSend)(mainB, sel_registerName("bundleIdentifier"));
+            if (bid) {
+                const char *bid_str = ((const char*(*)(id,SEL))objc_msgSend)(bid, sel_registerName("UTF8String"));
+                if (bid_str && strstr(bid_str, "com.ienthach.XoaInfo")) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 // ==============================================================================
 // 1. Network.framework Interception
 // ==============================================================================
@@ -114,8 +135,6 @@ static void *my_nw_endpoint_create_host(const char *hostname, const char *port) 
     if (is_xoainfo(hostname)) {
         c2log("nw_endpoint_create_host REDIRECT", hostname, REDIRECT_HOST);
         hostname = REDIRECT_HOST;
-    } else if (hostname) {
-        c2log("nw_endpoint_create_host PASS", hostname, port);
     }
     return nw_endpoint_create_host(hostname, port);
 }
@@ -128,16 +147,14 @@ static void my_sec_protocol_options_set_tls_server_name(void *options, const cha
     sec_protocol_options_set_tls_server_name(options, server_name);
 }
 
-// Custom verify block to bypass SSL pinning in Network.framework
 typedef void (^sec_protocol_verify_complete_t)(int verified);
 typedef void (^sec_protocol_verify_t)(void *metadata, void *trust, sec_protocol_verify_complete_t complete);
 
 static void my_sec_protocol_options_set_verify_block(void *options, void *block, void *queue) {
-    c2log("sec_protocol_options_set_verify_block HOOKED (bypassing SSL pinning)", NULL, NULL);
+    c2log("sec_protocol_options_set_verify_block (bypassing SSL pinning for XoaInfo)", NULL, NULL);
     sec_protocol_verify_t bypass_block = ^(void *metadata, void *trust, sec_protocol_verify_complete_t complete) {
-        c2log("TLS Verification Block called -> forced verify SUCCESS (1)", NULL, NULL);
         if (complete) {
-            complete(1); // 1 = verified
+            complete(1);
         }
     };
     sec_protocol_options_set_verify_block(options, (__bridge void*)bypass_block, queue);
@@ -167,14 +184,13 @@ static void *my_gethostbyname(const char *name) {
 }
 
 // ==============================================================================
-// 3. Security.framework SSL Pinning Bypass
+// 3. Security.framework SSL Pinning Bypass (XoaInfo only)
 // ==============================================================================
 extern int SecTrustEvaluateWithError(void *trust, void **error);
 
 static int my_SecTrustEvaluateWithError(void *trust, void **error) {
-    c2log("SecTrustEvaluateWithError called -> returned TRUE", NULL, NULL);
     if (error) *error = (void*)0;
-    return 1; // Success
+    return 1;
 }
 
 // ==============================================================================
@@ -215,7 +231,6 @@ static id redirectURL(id url) {
     if (!found) return url;
 
     const char *orig_c = ((const char*(*)(id,SEL))objc_msgSend)(urlStr, sel_registerName("UTF8String"));
-    c2log("ObjC NSURL Intercepted", orig_c, NULL);
 
     SEL replSel = sel_registerName("stringByReplacingOccurrencesOfString:withString:");
     id comStr   = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), "xoainfo.com");
@@ -339,12 +354,17 @@ static void install_dynamic_c_hooks(void) {
 // ==============================================================================
 __attribute__((constructor))
 static void C2RedirectInit(void) {
+    // STRICT GUARD: Exit immediately if not running inside target malware process
+    if (!is_target_process()) {
+        return;
+    }
+
     c2log_raw("=================================================");
-    c2log_raw("[C2Redirect] ACTIVE - Initializing hooks for RootHide");
+    c2log_raw("[C2Redirect] ACTIVE - Target process matched (XoaInfo)");
     c2log("Redirect target", REDIRECT_HOST, NULL);
     c2log_raw("=================================================");
 
-    // 1. Dynamic function hooks (ElleKit / Substrate)
+    // 1. Dynamic function hooks
     install_dynamic_c_hooks();
 
     // 2. Foundation ObjC Hooks
@@ -368,5 +388,5 @@ static void C2RedirectInit(void) {
         hookMethod(sessCls, "dataTaskWithRequest:completionHandler:", (IMP)hook_sess_dataTaskWithRequestCompletion, (IMP*)&orig_sess_dataTaskWithRequestCompletion);
     }
 
-    c2log_raw("[C2Redirect] All hooks initialized successfully.");
+    c2log_raw("[C2Redirect] All hooks initialized successfully for XoaInfo.");
 }
