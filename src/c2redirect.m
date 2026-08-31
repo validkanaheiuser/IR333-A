@@ -391,12 +391,26 @@ static void hookMethod(Class cls, const char *selName, IMP newIMP, IMP *origIMP,
 typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
 
 static void install_dynamic_c_hooks(void) {
-    MSHookFunction_t msHook = (MSHookFunction_t)dlsym((void*)-2, "MSHookFunction");
+    void *hElle = dlopen("/usr/lib/libellekit.dylib", 2 /* RTLD_NOW */);
+    if (!hElle) hElle = dlopen("libellekit.dylib", 2);
+    if (!hElle) hElle = dlopen("/usr/lib/libsubstrate.dylib", 2);
+    if (!hElle) hElle = dlopen("libsubstrate.dylib", 2);
+
+    MSHookFunction_t msHook = NULL;
+    if (hElle) {
+        msHook = (MSHookFunction_t)dlsym(hElle, "MSHookFunction");
+        if (!msHook) msHook = (MSHookFunction_t)dlsym(hElle, "DobbyHook");
+        if (!msHook) msHook = (MSHookFunction_t)dlsym(hElle, "LBHookFunction");
+    }
+    if (!msHook) {
+        msHook = (MSHookFunction_t)dlsym((void*)-2, "MSHookFunction");
+    }
     if (!msHook) {
         msHook = (MSHookFunction_t)dlsym((void*)-2, "DobbyHook");
     }
+
     if (msHook) {
-        c2log("MSHookFunction/DobbyHook found in runtime -> installing dynamic C hooks", NULL, NULL);
+        c2log("MSHookFunction/DobbyHook found in ElleKit -> installing C hooks", NULL, NULL);
         void *fn_nw_host = dlsym((void*)-2, "nw_endpoint_create_host");
         if (fn_nw_host) {
             msHook(fn_nw_host, (void*)my_nw_endpoint_create_host, (void**)&orig_nw_endpoint_create_host);
@@ -425,6 +439,8 @@ static void install_dynamic_c_hooks(void) {
         if (fn_ste_old) {
             msHook(fn_ste_old, (void*)my_SecTrustEvaluate, (void**)&orig_SecTrustEvaluate);
         }
+    } else {
+        c2log("WARNING: MSHookFunction not found in global runtime", NULL, NULL);
     }
 }
 
