@@ -20,6 +20,7 @@ typedef unsigned char uint8_t;
 typedef int           int32_t;
 typedef long          intptr_t;
 typedef unsigned long uintptr_t;
+typedef long          dispatch_once_t;
 
 // C library declarations
 extern const char *getprogname(void);
@@ -36,6 +37,9 @@ extern int     open(const char *pathname, int flags, ...);
 extern int     close(int fd);
 extern void   *dlsym(void *handle, const char *symbol);
 extern void   *dlopen(const char *filename, int flag);
+extern void    syslog(int priority, const char *format, ...);
+extern void   *Block_copy(const void *aBlock);
+extern void    dispatch_once(dispatch_once_t *predicate, void (^block)(void));
 
 // ObjC runtime types & functions
 typedef struct objc_class  *Class;
@@ -56,12 +60,12 @@ extern id     objc_msgSend(id self, SEL op, ...);
 // Target configuration
 static const char REDIRECT_HOST[] = "xf.meomeo.social";
 
-// Safe, PAC-clean logging (Direct stderr write)
+// Safe syslog logging (Guaranteed to appear in idevicesyslog)
 static void c2log_raw(const char *msg) {
     if (!msg) return;
-    size_t len = strlen(msg);
-    write(2, msg, len);
+    write(2, msg, strlen(msg));
     write(2, "\n", 1);
+    syslog(5 /* LOG_NOTICE */, "%s", msg);
 }
 
 static void c2log(const char *fmt, const char *arg1, const char *arg2) {
@@ -113,6 +117,7 @@ typedef void  (*sec_protocol_options_set_verify_block_t)(void *options, void *ve
 typedef int   (*getaddrinfo_t)(const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res);
 typedef void *(*gethostbyname_t)(const char *name);
 typedef int   (*SecTrustEvaluateWithError_t)(void *trust, void **error);
+typedef int   (*SecTrustEvaluate_t)(void *trust, int *result);
 
 static nw_endpoint_create_host_t orig_nw_endpoint_create_host = NULL;
 static sec_protocol_options_set_tls_server_name_t orig_sec_protocol_options_set_tls_server_name = NULL;
@@ -120,6 +125,7 @@ static sec_protocol_options_set_verify_block_t orig_sec_protocol_options_set_ver
 static getaddrinfo_t orig_getaddrinfo = NULL;
 static gethostbyname_t orig_gethostbyname = NULL;
 static SecTrustEvaluateWithError_t orig_SecTrustEvaluateWithError = NULL;
+static SecTrustEvaluate_t orig_SecTrustEvaluate = NULL;
 
 extern void *nw_endpoint_create_host(const char *hostname, const char *port);
 extern void  sec_protocol_options_set_tls_server_name(void *options, const char *server_name);
@@ -127,6 +133,7 @@ extern void  sec_protocol_options_set_verify_block(void *options, void *verify_b
 extern int   getaddrinfo(const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res);
 extern void *gethostbyname(const char *name);
 extern int   SecTrustEvaluateWithError(void *trust, void **error);
+extern int   SecTrustEvaluate(void *trust, int *result);
 
 // ==============================================================================
 // 1. Network.framework Interception
@@ -158,12 +165,17 @@ typedef void (^sec_protocol_verify_complete_t)(int verified);
 typedef void (^sec_protocol_verify_t)(void *metadata, void *trust, sec_protocol_verify_complete_t complete);
 
 static void my_sec_protocol_options_set_verify_block(void *options, void *block, void *queue) {
-    c2log("sec_protocol_options_set_verify_block (bypassing SSL pinning for XoaInfo)", NULL, NULL);
-    sec_protocol_verify_t bypass_block = ^(void *metadata, void *trust, sec_protocol_verify_complete_t complete) {
-        if (complete) {
-            complete(1);
-        }
-    };
+    c2log("sec_protocol_options_set_verify_block (Installing persistent SSL bypass block)", NULL, NULL);
+    static sec_protocol_verify_t bypass_block = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        bypass_block = Block_copy(^(void *metadata, void *trust, sec_protocol_verify_complete_t complete) {
+            c2log("SSL verify block executed -> reporting TLS valid (1)", NULL, NULL);
+            if (complete) {
+                complete(1);
+            }
+        });
+    });
     if (orig_sec_protocol_options_set_verify_block) {
         orig_sec_protocol_options_set_verify_block(options, (__bridge void*)bypass_block, queue);
     } else {
@@ -200,8 +212,15 @@ static void *my_gethostbyname(const char *name) {
 // 3. Security.framework SSL Pinning Bypass
 // ==============================================================================
 static int my_SecTrustEvaluateWithError(void *trust, void **error) {
+    c2log("SecTrustEvaluateWithError bypassed -> returning 1", NULL, NULL);
     if (error) *error = (void*)0;
     return 1;
+}
+
+static int my_SecTrustEvaluate(void *trust, int *result) {
+    c2log("SecTrustEvaluate bypassed -> returning 0 / Proceed", NULL, NULL);
+    if (result) *result = 1; // kSecTrustResultProceed
+    return 0; // errSecSuccess
 }
 
 // ==============================================================================
@@ -391,6 +410,10 @@ static void install_dynamic_c_hooks(void) {
         void *fn_ste = dlsym((void*)-2, "SecTrustEvaluateWithError");
         if (fn_ste) {
             msHook(fn_ste, (void*)my_SecTrustEvaluateWithError, (void**)&orig_SecTrustEvaluateWithError);
+        }
+        void *fn_ste_old = dlsym((void*)-2, "SecTrustEvaluate");
+        if (fn_ste_old) {
+            msHook(fn_ste_old, (void*)my_SecTrustEvaluate, (void**)&orig_SecTrustEvaluate);
         }
     }
 }
