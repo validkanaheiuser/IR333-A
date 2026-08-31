@@ -1,7 +1,7 @@
 // ==============================================================================
 // XoaInfo C2 Redirect Tweak for RootHide / Dopamine
 // Redirects ALL outbound non-Apple traffic in XoaInfo to xf.meomeo.social
-// and bypasses tlsVerified pre-check
+// Rewrites Host header to xf.meomeo.social to bypass Cloudflare 403 Host Mismatch
 // ==============================================================================
 
 #pragma clang diagnostic ignored "-Weverything"
@@ -87,7 +87,6 @@ static void c2log(const char *fmt, const char *arg1, const char *arg2) {
     c2log_raw(buf);
 }
 
-// Check if string contains target domains or endpoints (Catch-all for non-Apple)
 static int is_c2_target(const char *s) {
     if (!s || strlen(s) == 0) return 0;
     if (strstr(s, "127.0.0.1") || strstr(s, "localhost") ||
@@ -237,7 +236,7 @@ static BOOL hook_tlsVerified(id self, SEL _cmd) {
 }
 
 // ==============================================================================
-// 5. ObjC URL Redirection
+// 5. ObjC URL & Host Header Redirection (Fixes Cloudflare 403 Host Mismatch)
 // ==============================================================================
 static id redirectURLString(id urlStr) {
     if (!urlStr) return urlStr;
@@ -296,13 +295,19 @@ static id redirectRequestObj(id req) {
         if (newURL && newURL != url) {
             ((void(*)(id,SEL,id))objc_msgSend)(mreq, sel_registerName("setURL:"), newURL);
         }
-        // Inject Browser User-Agent to bypass Cloudflare Error 1010
         Class nss = objc_getClass("NSString");
         if (nss) {
+            // 1. Inject Browser User-Agent to bypass Cloudflare Error 1010
             id uaVal = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), DEFAULT_UA);
             id uaKey = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), "User-Agent");
             if (uaVal && uaKey) {
                 ((void(*)(id,SEL,id,id))objc_msgSend)(mreq, sel_registerName("setValue:forHTTPHeaderField:"), uaVal, uaKey);
+            }
+            // 2. Set Host header to xf.meomeo.social to avoid Cloudflare 403 Host Mismatch
+            id hostVal = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), REDIRECT_HOST);
+            id hostKey = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), "Host");
+            if (hostVal && hostKey) {
+                ((void(*)(id,SEL,id,id))objc_msgSend)(mreq, sel_registerName("setValue:forHTTPHeaderField:"), hostVal, hostKey);
             }
         }
         return mreq;
