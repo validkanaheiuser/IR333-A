@@ -1,6 +1,7 @@
 // ==============================================================================
 // XoaInfo C2 Redirect Tweak for RootHide / Dopamine
 // STRICT TARGET FILTER: Only activates within com.ienthach.XoaInfo / XoaInfo binaries.
+// Fixed: Proper original function pointer calling to prevent stack recursion crash.
 // ==============================================================================
 
 #pragma clang diagnostic ignored "-Weverything"
@@ -124,17 +125,41 @@ static int is_target_process(void) {
 }
 
 // ==============================================================================
-// 1. Network.framework Interception
+// Function pointer types for C hooks
 // ==============================================================================
+struct addrinfo;
+
+typedef void *(*nw_endpoint_create_host_t)(const char *hostname, const char *port);
+typedef void  (*sec_protocol_options_set_tls_server_name_t)(void *options, const char *server_name);
+typedef void  (*sec_protocol_options_set_verify_block_t)(void *options, void *verify_block, void *verify_queue);
+typedef int   (*getaddrinfo_t)(const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res);
+typedef void *(*gethostbyname_t)(const char *name);
+typedef int   (*SecTrustEvaluateWithError_t)(void *trust, void **error);
+
+static nw_endpoint_create_host_t orig_nw_endpoint_create_host = NULL;
+static sec_protocol_options_set_tls_server_name_t orig_sec_protocol_options_set_tls_server_name = NULL;
+static sec_protocol_options_set_verify_block_t orig_sec_protocol_options_set_verify_block = NULL;
+static getaddrinfo_t orig_getaddrinfo = NULL;
+static gethostbyname_t orig_gethostbyname = NULL;
+static SecTrustEvaluateWithError_t orig_SecTrustEvaluateWithError = NULL;
+
 extern void *nw_endpoint_create_host(const char *hostname, const char *port);
 extern void  sec_protocol_options_set_tls_server_name(void *options, const char *server_name);
 extern void  sec_protocol_options_set_verify_block(void *options, void *verify_block, void *verify_queue);
-extern void *sec_trust_copy_ref(void *trust);
+extern int   getaddrinfo(const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res);
+extern void *gethostbyname(const char *name);
+extern int   SecTrustEvaluateWithError(void *trust, void **error);
 
+// ==============================================================================
+// 1. Network.framework Interception
+// ==============================================================================
 static void *my_nw_endpoint_create_host(const char *hostname, const char *port) {
     if (is_xoainfo(hostname)) {
         c2log("nw_endpoint_create_host REDIRECT", hostname, REDIRECT_HOST);
         hostname = REDIRECT_HOST;
+    }
+    if (orig_nw_endpoint_create_host) {
+        return orig_nw_endpoint_create_host(hostname, port);
     }
     return nw_endpoint_create_host(hostname, port);
 }
@@ -144,7 +169,11 @@ static void my_sec_protocol_options_set_tls_server_name(void *options, const cha
         c2log("sec_protocol_options_set_tls_server_name REDIRECT", server_name, REDIRECT_HOST);
         server_name = REDIRECT_HOST;
     }
-    sec_protocol_options_set_tls_server_name(options, server_name);
+    if (orig_sec_protocol_options_set_tls_server_name) {
+        orig_sec_protocol_options_set_tls_server_name(options, server_name);
+    } else {
+        sec_protocol_options_set_tls_server_name(options, server_name);
+    }
 }
 
 typedef void (^sec_protocol_verify_complete_t)(int verified);
@@ -157,20 +186,23 @@ static void my_sec_protocol_options_set_verify_block(void *options, void *block,
             complete(1);
         }
     };
-    sec_protocol_options_set_verify_block(options, (__bridge void*)bypass_block, queue);
+    if (orig_sec_protocol_options_set_verify_block) {
+        orig_sec_protocol_options_set_verify_block(options, (__bridge void*)bypass_block, queue);
+    } else {
+        sec_protocol_options_set_verify_block(options, (__bridge void*)bypass_block, queue);
+    }
 }
 
 // ==============================================================================
 // 2. libSystem DNS & Hostname Interception
 // ==============================================================================
-struct addrinfo;
-extern int   getaddrinfo(const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res);
-extern void *gethostbyname(const char *name);
-
 static int my_getaddrinfo(const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res) {
     if (is_xoainfo(hostname)) {
         c2log("getaddrinfo REDIRECT", hostname, REDIRECT_HOST);
         hostname = REDIRECT_HOST;
+    }
+    if (orig_getaddrinfo) {
+        return orig_getaddrinfo(hostname, servname, hints, res);
     }
     return getaddrinfo(hostname, servname, hints, res);
 }
@@ -180,37 +212,19 @@ static void *my_gethostbyname(const char *name) {
         c2log("gethostbyname REDIRECT", name, REDIRECT_HOST);
         name = REDIRECT_HOST;
     }
+    if (orig_gethostbyname) {
+        return orig_gethostbyname(name);
+    }
     return gethostbyname(name);
 }
 
 // ==============================================================================
-// 3. Security.framework SSL Pinning Bypass (XoaInfo only)
+// 3. Security.framework SSL Pinning Bypass
 // ==============================================================================
-extern int SecTrustEvaluateWithError(void *trust, void **error);
-
 static int my_SecTrustEvaluateWithError(void *trust, void **error) {
     if (error) *error = (void*)0;
     return 1;
 }
-
-// ==============================================================================
-// DYLD_INTERPOSE Macro
-// ==============================================================================
-#define DYLD_INTERPOSE(_repl, _orig) \
-  __attribute__((used)) \
-  static struct { const void *repl; const void *orig; } \
-  _interpose_##_orig \
-  __attribute__((section("__DATA,__interpose"))) = { \
-      (const void *)(unsigned long)&_repl, \
-      (const void *)(unsigned long)&_orig \
-  };
-
-DYLD_INTERPOSE(my_nw_endpoint_create_host, nw_endpoint_create_host);
-DYLD_INTERPOSE(my_sec_protocol_options_set_tls_server_name, sec_protocol_options_set_tls_server_name);
-DYLD_INTERPOSE(my_sec_protocol_options_set_verify_block, sec_protocol_options_set_verify_block);
-DYLD_INTERPOSE(my_getaddrinfo, getaddrinfo);
-DYLD_INTERPOSE(my_gethostbyname, gethostbyname);
-DYLD_INTERPOSE(my_SecTrustEvaluateWithError, SecTrustEvaluateWithError);
 
 // ==============================================================================
 // 4. ObjC Foundation / NSURLRequest / NSURLSession Swizzles
@@ -315,7 +329,7 @@ static void hookMethod(Class cls, const char *selName, IMP newIMP, IMP *origIMP)
 }
 
 // ==============================================================================
-// 5. Dynamic Substrate / ElleKit Function Hook Fallback
+// 5. Dynamic Substrate / ElleKit Function Hook Registration
 // ==============================================================================
 typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
 
@@ -328,23 +342,27 @@ static void install_dynamic_c_hooks(void) {
         c2log("MSHookFunction/DobbyHook found in runtime -> installing dynamic C hooks", NULL, NULL);
         void *fn_nw_host = dlsym((void*)-2, "nw_endpoint_create_host");
         if (fn_nw_host) {
-            static void *orig_nw_host = (void*)0;
-            msHook(fn_nw_host, (void*)my_nw_endpoint_create_host, &orig_nw_host);
+            msHook(fn_nw_host, (void*)my_nw_endpoint_create_host, (void**)&orig_nw_endpoint_create_host);
         }
         void *fn_tls_sni = dlsym((void*)-2, "sec_protocol_options_set_tls_server_name");
         if (fn_tls_sni) {
-            static void *orig_tls_sni = (void*)0;
-            msHook(fn_tls_sni, (void*)my_sec_protocol_options_set_tls_server_name, &orig_tls_sni);
+            msHook(fn_tls_sni, (void*)my_sec_protocol_options_set_tls_server_name, (void**)&orig_sec_protocol_options_set_tls_server_name);
         }
         void *fn_tls_verify = dlsym((void*)-2, "sec_protocol_options_set_verify_block");
         if (fn_tls_verify) {
-            static void *orig_tls_verify = (void*)0;
-            msHook(fn_tls_verify, (void*)my_sec_protocol_options_set_verify_block, &orig_tls_verify);
+            msHook(fn_tls_verify, (void*)my_sec_protocol_options_set_verify_block, (void**)&orig_sec_protocol_options_set_verify_block);
         }
         void *fn_gai = dlsym((void*)-2, "getaddrinfo");
         if (fn_gai) {
-            static void *orig_gai = (void*)0;
-            msHook(fn_gai, (void*)my_getaddrinfo, &orig_gai);
+            msHook(fn_gai, (void*)my_getaddrinfo, (void**)&orig_getaddrinfo);
+        }
+        void *fn_ghbn = dlsym((void*)-2, "gethostbyname");
+        if (fn_ghbn) {
+            msHook(fn_ghbn, (void*)my_gethostbyname, (void**)&orig_gethostbyname);
+        }
+        void *fn_ste = dlsym((void*)-2, "SecTrustEvaluateWithError");
+        if (fn_ste) {
+            msHook(fn_ste, (void*)my_SecTrustEvaluateWithError, (void**)&orig_SecTrustEvaluateWithError);
         }
     }
 }
@@ -354,7 +372,6 @@ static void install_dynamic_c_hooks(void) {
 // ==============================================================================
 __attribute__((constructor))
 static void C2RedirectInit(void) {
-    // STRICT GUARD: Exit immediately if not running inside target malware process
     if (!is_target_process()) {
         return;
     }
