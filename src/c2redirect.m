@@ -129,7 +129,6 @@ typedef void  (*sec_protocol_options_set_verify_block_t)(void *options, void *ve
 typedef int   (*getaddrinfo_t)(const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res);
 typedef void *(*gethostbyname_t)(const char *name);
 typedef int   (*SecTrustEvaluateWithError_t)(void *trust, void **error);
-typedef void *(*CFURLCreateWithString_t)(void *allocator, void *URLString, void *baseURL);
 
 static nw_endpoint_create_host_t orig_nw_endpoint_create_host = NULL;
 static sec_protocol_options_set_tls_server_name_t orig_sec_protocol_options_set_tls_server_name = NULL;
@@ -137,7 +136,6 @@ static sec_protocol_options_set_verify_block_t orig_sec_protocol_options_set_ver
 static getaddrinfo_t orig_getaddrinfo = NULL;
 static gethostbyname_t orig_gethostbyname = NULL;
 static SecTrustEvaluateWithError_t orig_SecTrustEvaluateWithError = NULL;
-static CFURLCreateWithString_t orig_CFURLCreateWithString = NULL;
 
 extern void *nw_endpoint_create_host(const char *hostname, const char *port);
 extern void  sec_protocol_options_set_tls_server_name(void *options, const char *server_name);
@@ -145,7 +143,6 @@ extern void  sec_protocol_options_set_verify_block(void *options, void *verify_b
 extern int   getaddrinfo(const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res);
 extern void *gethostbyname(const char *name);
 extern int   SecTrustEvaluateWithError(void *trust, void **error);
-extern void *CFURLCreateWithString(void *allocator, void *URLString, void *baseURL);
 
 // ==============================================================================
 // 1. Network.framework Interception
@@ -232,21 +229,41 @@ static id redirectURLString(id urlStr) {
     if (!nss) return urlStr;
 
     const char *orig_c = ((const char*(*)(id,SEL))objc_msgSend)(urlStr, sel_registerName("UTF8String"));
-    if (!orig_c || !is_c2_target(orig_c)) return urlStr;
+    if (!orig_c || strstr(orig_c, REDIRECT_HOST)) return urlStr;
+    if (!is_c2_target(orig_c)) return urlStr;
 
     SEL replSel = sel_registerName("stringByReplacingOccurrencesOfString:withString:");
-    id comStr   = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), "xoainfo.com");
-    id netStr   = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), "xoainfo.net");
-    id ipApiStr = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), "ip-api.com");
     id redirStr = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), REDIRECT_HOST);
 
-    id newStr = ((id(*)(id,SEL,id,id))objc_msgSend)(urlStr, replSel, comStr, redirStr);
-    newStr    = ((id(*)(id,SEL,id,id))objc_msgSend)(newStr,  replSel, netStr, redirStr);
-    newStr    = ((id(*)(id,SEL,id,id))objc_msgSend)(newStr,  replSel, ipApiStr, redirStr);
+    const char *known_domains[] = {
+        "xoainfo.com", "xoainfo.net", "sv.xoainfo.com", "sv.xoainfo.net",
+        "api.xoainfo.com", "api.xoainfo.net", "ip-api.com", NULL
+    };
+    id currentStr = urlStr;
+    for (int i = 0; known_domains[i] != NULL; i++) {
+        id domStr = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), known_domains[i]);
+        currentStr = ((id(*)(id,SEL,id,id))objc_msgSend)(currentStr, replSel, domStr, redirStr);
+    }
 
-    const char *new_c = ((const char*(*)(id,SEL))objc_msgSend)(newStr, sel_registerName("UTF8String"));
-    c2log("ObjC URLString Redirected", orig_c, new_c);
-    return newStr;
+    const char *curr_c = ((const char*(*)(id,SEL))objc_msgSend)(currentStr, sel_registerName("UTF8String"));
+    if (curr_c && !strstr(curr_c, REDIRECT_HOST) && (strstr(curr_c, "juno/") || strstr(curr_c, "loginip") || strstr(curr_c, "redeemcode"))) {
+        Class nsu = objc_getClass("NSURL");
+        if (nsu) {
+            id tempURL = ((id(*)(id,SEL,id))objc_msgSend)((id)nsu, sel_registerName("URLWithString:"), currentStr);
+            if (tempURL) {
+                id host = ((id(*)(id,SEL))objc_msgSend)(tempURL, sel_registerName("host"));
+                if (host) {
+                    currentStr = ((id(*)(id,SEL,id,id))objc_msgSend)(currentStr, replSel, host, redirStr);
+                }
+            }
+        }
+    }
+
+    const char *new_c = ((const char*(*)(id,SEL))objc_msgSend)(currentStr, sel_registerName("UTF8String"));
+    if (new_c && strcmp(orig_c, new_c) != 0) {
+        c2log("ObjC URLString Redirected", orig_c, new_c);
+    }
+    return currentStr;
 }
 
 static id redirectURL(id url) {
@@ -264,13 +281,18 @@ static id redirectURL(id url) {
     return newURL ? newURL : url;
 }
 
-static void redirectRequest(id req) {
-    if (!req) return;
+static id redirectRequestObj(id req) {
+    if (!req) return req;
     id url = ((id(*)(id,SEL))objc_msgSend)(req, sel_registerName("URL"));
     id newURL = redirectURL(url);
-    if (newURL && newURL != url) {
-        ((void(*)(id,SEL,id))objc_msgSend)(req, sel_registerName("setURL:"), newURL);
+    if (!newURL || newURL == url) return req;
+
+    id mreq = ((id(*)(id,SEL))objc_msgSend)(req, sel_registerName("mutableCopy"));
+    if (mreq) {
+        ((void(*)(id,SEL,id))objc_msgSend)(mreq, sel_registerName("setURL:"), newURL);
+        return mreq;
     }
+    return req;
 }
 
 // Saved IMPs
@@ -279,6 +301,7 @@ static id (*orig_url_initWithString)(id, SEL, id);
 static id (*orig_req_requestWithURL)(id, SEL, id);
 static id (*orig_req_initWithURL)(id, SEL, id);
 static id (*orig_req_initWithURLFull)(id, SEL, id, long, double);
+static id (*orig_mreq_requestWithURL)(id, SEL, id);
 static id (*orig_mreq_initWithURL)(id, SEL, id);
 static id (*orig_mreq_initWithURLFull)(id, SEL, id, long, double);
 static void (*orig_mreq_setURL)(id, SEL, id);
@@ -310,6 +333,10 @@ static id hook_req_initWithURLFull(id self, SEL _cmd, id url, long policy, doubl
     return orig_req_initWithURLFull(self, _cmd, redirectURL(url), policy, timeout);
 }
 
+static id hook_mreq_requestWithURL(id self, SEL _cmd, id url) {
+    return orig_mreq_requestWithURL(self, _cmd, redirectURL(url));
+}
+
 static id hook_mreq_initWithURL(id self, SEL _cmd, id url) {
     return orig_mreq_initWithURL(self, _cmd, redirectURL(url));
 }
@@ -331,23 +358,19 @@ static id hook_sess_dataTaskWithURLCompletion(id self, SEL _cmd, id url, id bloc
 }
 
 static id hook_sess_dataTaskWithRequest(id self, SEL _cmd, id req) {
-    redirectRequest(req);
-    return orig_sess_dataTaskWithRequest(self, _cmd, req);
+    return orig_sess_dataTaskWithRequest(self, _cmd, redirectRequestObj(req));
 }
 
 static id hook_sess_dataTaskWithRequestCompletion(id self, SEL _cmd, id req, id block) {
-    redirectRequest(req);
-    return orig_sess_dataTaskWithRequestCompletion(self, _cmd, req, block);
+    return orig_sess_dataTaskWithRequestCompletion(self, _cmd, redirectRequestObj(req), block);
 }
 
 static id hook_conn_sendSync(id self, SEL _cmd, id req, void *resp, void *err) {
-    redirectRequest(req);
-    return orig_conn_sendSync(self, _cmd, req, resp, err);
+    return orig_conn_sendSync(self, _cmd, redirectRequestObj(req), resp, err);
 }
 
 static id hook_conn_initWithRequest(id self, SEL _cmd, id req, id delegate) {
-    redirectRequest(req);
-    return orig_conn_initWithRequest(self, _cmd, req, delegate);
+    return orig_conn_initWithRequest(self, _cmd, redirectRequestObj(req), delegate);
 }
 
 static void hookMethod(Class cls, const char *selName, IMP newIMP, IMP *origIMP, int isClassMethod) {
@@ -432,8 +455,9 @@ static void C2RedirectInit(void) {
         hookMethod(reqCls, "initWithURL:cachePolicy:timeoutInterval:", (IMP)hook_req_initWithURLFull, (IMP*)&orig_req_initWithURLFull, 0);
     }
     if (mreqCls) {
+        hookMethod(mreqCls, "requestWithURL:", (IMP)hook_mreq_requestWithURL, (IMP*)&orig_mreq_requestWithURL, 1);
         hookMethod(mreqCls, "initWithURL:", (IMP)hook_mreq_initWithURL, (IMP*)&orig_mreq_initWithURL, 0);
-        hookMethod(mreqCls, "initWithURL:cachePolicy:timeoutInterval:", (IMP)hook_req_initWithURLFull, (IMP*)&orig_mreq_initWithURLFull, 0);
+        hookMethod(mreqCls, "initWithURL:cachePolicy:timeoutInterval:", (IMP)hook_mreq_initWithURLFull, (IMP*)&orig_mreq_initWithURLFull, 0);
         hookMethod(mreqCls, "setURL:", (IMP)hook_mreq_setURL, (IMP*)&orig_mreq_setURL, 0);
     }
     if (sessCls) {
