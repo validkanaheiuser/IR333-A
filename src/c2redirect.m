@@ -52,29 +52,16 @@ extern Method class_getClassMethod(Class cls, SEL name);
 extern IMP    method_getImplementation(Method m);
 extern void   method_setImplementation(Method m, IMP imp);
 extern id     objc_msgSend(id self, SEL op, ...);
-extern void   NSLog(id format, ...);
 
 // Target configuration
 static const char REDIRECT_HOST[] = "xf.meomeo.social";
 
-// Safe logging
+// Safe, PAC-clean logging (Direct stderr write)
 static void c2log_raw(const char *msg) {
     if (!msg) return;
     size_t len = strlen(msg);
     write(2, msg, len);
     write(2, "\n", 1);
-
-    Class nss = objc_getClass("NSString");
-    if (nss) {
-        id str = ((id(*)(id,SEL,const char*))objc_msgSend)(
-            (id)nss, sel_registerName("stringWithUTF8String:"), msg);
-        if (str) {
-            id fmt = ((id(*)(id,SEL,const char*))objc_msgSend)(
-                (id)nss, sel_registerName("stringWithUTF8String:"), "%@");
-            ((void(*)(id,SEL,id,id))objc_msgSend)((id)nss, sel_registerName("stringWithFormat:"), fmt, str);
-            NSLog(str);
-        }
-    }
 }
 
 static void c2log(const char *fmt, const char *arg1, const char *arg2) {
