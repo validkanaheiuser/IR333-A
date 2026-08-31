@@ -140,7 +140,7 @@ static void my_sec_protocol_options_set_verify_block(void *options, void *block,
             complete(1); // 1 = verified
         }
     };
-    sec_protocol_options_set_verify_block(options, (void*)bypass_block, queue);
+    sec_protocol_options_set_verify_block(options, (__bridge void*)bypass_block, queue);
 }
 
 // ==============================================================================
