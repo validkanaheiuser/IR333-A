@@ -1,6 +1,6 @@
 // ==============================================================================
 // XoaInfo C2 Redirect Tweak for RootHide / Dopamine
-// Redirects all C2/Auth traffic to xf.meomeo.social
+// Redirects ALL outbound non-Apple traffic in XoaInfo to xf.meomeo.social
 // ==============================================================================
 
 #pragma clang diagnostic ignored "-Weverything"
@@ -64,18 +64,14 @@ static void c2log_raw(const char *msg) {
     write(2, msg, len);
     write(2, "\n", 1);
 
-    int fd = open("/tmp/c2redirect.log", 0x0001 | 0x0008 | 0x0200, 0666);
-    if (fd >= 0) {
-        write(fd, msg, len);
-        write(fd, "\n", 1);
-        close(fd);
-    }
-
     Class nss = objc_getClass("NSString");
     if (nss) {
         id str = ((id(*)(id,SEL,const char*))objc_msgSend)(
             (id)nss, sel_registerName("stringWithUTF8String:"), msg);
         if (str) {
+            id fmt = ((id(*)(id,SEL,const char*))objc_msgSend)(
+                (id)nss, sel_registerName("stringWithUTF8String:"), "%@");
+            ((void(*)(id,SEL,id,id))objc_msgSend)((id)nss, sel_registerName("stringWithFormat:"), fmt, str);
             NSLog(str);
         }
     }
@@ -93,15 +89,16 @@ static void c2log(const char *fmt, const char *arg1, const char *arg2) {
     c2log_raw(buf);
 }
 
-// Check if string contains target domains or endpoints
+// Check if string contains target domains or endpoints (Catch-all for non-Apple)
 static int is_c2_target(const char *s) {
-    if (!s) return 0;
-    if (strstr(s, "xoainfo") || strstr(s, "XoaInfo") || strstr(s, "XOAINFO") ||
-        strstr(s, "juno") || strstr(s, "loginip") || strstr(s, "redeemcode") ||
-        strstr(s, "ienthach") || strstr(s, "ip-api.com")) {
-        return 1;
+    if (!s || strlen(s) == 0) return 0;
+    // Don't redirect localhost, Apple, or already redirected host
+    if (strstr(s, "127.0.0.1") || strstr(s, "localhost") ||
+        strstr(s, "apple.com") || strstr(s, "icloud.com") ||
+        strstr(s, "meomeo.social")) {
+        return 0;
     }
-    return 0;
+    return 1;
 }
 
 // Strict process check to protect SpringBoard and system daemons
@@ -226,7 +223,8 @@ static int my_SecTrustEvaluateWithError(void *trust, void **error) {
 static id redirectURLString(id urlStr) {
     if (!urlStr) return urlStr;
     Class nss = objc_getClass("NSString");
-    if (!nss) return urlStr;
+    Class nsu = objc_getClass("NSURL");
+    if (!nss || !nsu) return urlStr;
 
     const char *orig_c = ((const char*(*)(id,SEL))objc_msgSend)(urlStr, sel_registerName("UTF8String"));
     if (!orig_c || strstr(orig_c, REDIRECT_HOST)) return urlStr;
@@ -235,26 +233,15 @@ static id redirectURLString(id urlStr) {
     SEL replSel = sel_registerName("stringByReplacingOccurrencesOfString:withString:");
     id redirStr = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), REDIRECT_HOST);
 
-    const char *known_domains[] = {
-        "xoainfo.com", "xoainfo.net", "sv.xoainfo.com", "sv.xoainfo.net",
-        "api.xoainfo.com", "api.xoainfo.net", "ip-api.com", NULL
-    };
+    // Extract host and replace
+    id tempURL = ((id(*)(id,SEL,id))objc_msgSend)((id)nsu, sel_registerName("URLWithString:"), urlStr);
     id currentStr = urlStr;
-    for (int i = 0; known_domains[i] != NULL; i++) {
-        id domStr = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), known_domains[i]);
-        currentStr = ((id(*)(id,SEL,id,id))objc_msgSend)(currentStr, replSel, domStr, redirStr);
-    }
-
-    const char *curr_c = ((const char*(*)(id,SEL))objc_msgSend)(currentStr, sel_registerName("UTF8String"));
-    if (curr_c && !strstr(curr_c, REDIRECT_HOST) && (strstr(curr_c, "juno/") || strstr(curr_c, "loginip") || strstr(curr_c, "redeemcode"))) {
-        Class nsu = objc_getClass("NSURL");
-        if (nsu) {
-            id tempURL = ((id(*)(id,SEL,id))objc_msgSend)((id)nsu, sel_registerName("URLWithString:"), currentStr);
-            if (tempURL) {
-                id host = ((id(*)(id,SEL))objc_msgSend)(tempURL, sel_registerName("host"));
-                if (host) {
-                    currentStr = ((id(*)(id,SEL,id,id))objc_msgSend)(currentStr, replSel, host, redirStr);
-                }
+    if (tempURL) {
+        id host = ((id(*)(id,SEL))objc_msgSend)(tempURL, sel_registerName("host"));
+        if (host) {
+            const char *host_c = ((const char*(*)(id,SEL))objc_msgSend)(host, sel_registerName("UTF8String"));
+            if (is_c2_target(host_c)) {
+                currentStr = ((id(*)(id,SEL,id,id))objc_msgSend)(urlStr, replSel, host, redirStr);
             }
         }
     }
