@@ -1,6 +1,7 @@
 // ==============================================================================
 // XoaInfo C2 Redirect Tweak for RootHide / Dopamine
 // Redirects ALL outbound non-Apple traffic in XoaInfo to xf.meomeo.social
+// and bypasses tlsVerified pre-check
 // ==============================================================================
 
 #pragma clang diagnostic ignored "-Weverything"
@@ -21,6 +22,9 @@ typedef int           int32_t;
 typedef long          intptr_t;
 typedef unsigned long uintptr_t;
 typedef long          dispatch_once_t;
+typedef signed char   BOOL;
+#define YES ((BOOL)1)
+#define NO  ((BOOL)0)
 
 // C library declarations
 extern const char *getprogname(void);
@@ -39,6 +43,7 @@ extern void   *dlsym(void *handle, const char *symbol);
 extern void   *dlopen(const char *filename, int flag);
 extern void    syslog(int priority, const char *format, ...);
 extern void    dispatch_once(dispatch_once_t *predicate, void (^block)(void));
+extern void    free(void *ptr);
 
 // ObjC runtime types & functions
 typedef struct objc_class  *Class;
@@ -49,12 +54,14 @@ typedef struct objc_method_t *Method;
 
 extern Class  objc_getClass(const char *name);
 extern Class  object_getClass(id obj);
+extern const char *class_getName(Class cls);
 extern SEL    sel_registerName(const char *str);
 extern Method class_getInstanceMethod(Class cls, SEL name);
 extern Method class_getClassMethod(Class cls, SEL name);
 extern IMP    method_getImplementation(Method m);
 extern void   method_setImplementation(Method m, IMP imp);
 extern id     objc_msgSend(id self, SEL op, ...);
+extern Class *objc_copyClassList(unsigned int *outCount);
 
 // Target configuration
 static const char REDIRECT_HOST[] = "xf.meomeo.social";
@@ -83,7 +90,6 @@ static void c2log(const char *fmt, const char *arg1, const char *arg2) {
 // Check if string contains target domains or endpoints (Catch-all for non-Apple)
 static int is_c2_target(const char *s) {
     if (!s || strlen(s) == 0) return 0;
-    // Don't redirect localhost, Apple, or already redirected host
     if (strstr(s, "127.0.0.1") || strstr(s, "localhost") ||
         strstr(s, "apple.com") || strstr(s, "icloud.com") ||
         strstr(s, "meomeo.social")) {
@@ -92,7 +98,6 @@ static int is_c2_target(const char *s) {
     return 1;
 }
 
-// Strict process check to protect SpringBoard and system daemons
 static int is_target_process(void) {
     const char *prog = getprogname();
     if (prog) {
@@ -224,7 +229,15 @@ static int my_SecTrustEvaluate(void *trust, int *result) {
 }
 
 // ==============================================================================
-// 4. ObjC URL Redirection
+// 4. ObjC tlsVerified Bypass (Prevents Login button immediate trap crash)
+// ==============================================================================
+static BOOL hook_tlsVerified(id self, SEL _cmd) {
+    c2log("tlsVerified check -> ALWAYS returning YES (1)", NULL, NULL);
+    return YES;
+}
+
+// ==============================================================================
+// 5. ObjC URL Redirection
 // ==============================================================================
 static id redirectURLString(id urlStr) {
     if (!urlStr) return urlStr;
@@ -239,7 +252,6 @@ static id redirectURLString(id urlStr) {
     SEL replSel = sel_registerName("stringByReplacingOccurrencesOfString:withString:");
     id redirStr = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), REDIRECT_HOST);
 
-    // Extract host and replace
     id tempURL = ((id(*)(id,SEL,id))objc_msgSend)((id)nsu, sel_registerName("URLWithString:"), urlStr);
     id currentStr = urlStr;
     if (tempURL) {
@@ -386,7 +398,7 @@ static void hookMethod(Class cls, const char *selName, IMP newIMP, IMP *origIMP,
 }
 
 // ==============================================================================
-// 5. Dynamic Substrate / ElleKit Function Hook Registration
+// 6. Dynamic Substrate / ElleKit Function Hook Registration
 // ==============================================================================
 typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
 
@@ -445,7 +457,7 @@ static void install_dynamic_c_hooks(void) {
 }
 
 // ==============================================================================
-// 6. Constructor (Runs on injection)
+// 7. Constructor (Runs on injection)
 // ==============================================================================
 __attribute__((constructor))
 static void C2RedirectInit(void) {
@@ -458,7 +470,7 @@ static void C2RedirectInit(void) {
     c2log("Redirect target", REDIRECT_HOST, NULL);
     c2log_raw("=================================================");
 
-    // 1. Dynamic function hooks
+    // 1. Dynamic C-level hooks
     install_dynamic_c_hooks();
 
     // 2. Foundation ObjC Hooks
@@ -492,6 +504,27 @@ static void C2RedirectInit(void) {
     if (connCls) {
         hookMethod(connCls, "sendSynchronousRequest:returningResponse:error:", (IMP)hook_conn_sendSync, (IMP*)&orig_conn_sendSync, 1);
         hookMethod(connCls, "initWithRequest:delegate:", (IMP)hook_conn_initWithRequest, (IMP*)&orig_conn_initWithRequest, 0);
+    }
+
+    // 3. Swizzle tlsVerified across all runtime classes to bypass pre-flight crash
+    SEL sel_tls = sel_registerName("tlsVerified");
+    unsigned int numClasses = 0;
+    Class *classList = objc_copyClassList(&numClasses);
+    if (classList) {
+        for (unsigned int i = 0; i < numClasses; i++) {
+            Class cls = classList[i];
+            Method m = class_getInstanceMethod(cls, sel_tls);
+            if (m) {
+                method_setImplementation(m, (IMP)hook_tlsVerified);
+                c2log("Bypassed tlsVerified instance method on", class_getName(cls), NULL);
+            }
+            Method cm = class_getClassMethod(cls, sel_tls);
+            if (cm) {
+                method_setImplementation(cm, (IMP)hook_tlsVerified);
+                c2log("Bypassed tlsVerified class method on", class_getName(cls), NULL);
+            }
+        }
+        free(classList);
     }
 
     c2log_raw("[C2Redirect] All hooks initialized successfully.");
