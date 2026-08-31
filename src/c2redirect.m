@@ -1,7 +1,6 @@
 // ==============================================================================
 // XoaInfo C2 Redirect Tweak for RootHide / Dopamine
-// STRICT TARGET FILTER: Only activates within com.ienthach.XoaInfo / XoaInfo binaries.
-// Fixed: Proper original function pointer calling to prevent stack recursion crash.
+// Redirects all C2/Auth traffic to xf.meomeo.social
 // ==============================================================================
 
 #pragma clang diagnostic ignored "-Weverything"
@@ -28,6 +27,7 @@ extern size_t  strlen(const char *s);
 extern int     strcmp(const char *s1, const char *s2);
 extern int     strncmp(const char *s1, const char *s2, size_t n);
 extern char   *strstr(const char *haystack, const char *needle);
+extern char   *strcasestr(const char *haystack, const char *needle);
 extern char   *strcpy(char *dest, const char *src);
 extern char   *strncpy(char *dest, const char *src, size_t n);
 extern int     snprintf(char *str, size_t size, const char *fmt, ...);
@@ -45,6 +45,7 @@ typedef id (*IMP)(id, SEL, ...);
 typedef struct objc_method_t *Method;
 
 extern Class  objc_getClass(const char *name);
+extern Class  object_getClass(id obj);
 extern SEL    sel_registerName(const char *str);
 extern Method class_getInstanceMethod(Class cls, SEL name);
 extern Method class_getClassMethod(Class cls, SEL name);
@@ -92,9 +93,12 @@ static void c2log(const char *fmt, const char *arg1, const char *arg2) {
     c2log_raw(buf);
 }
 
-static int is_xoainfo(const char *s) {
+// Check if string contains target domains or endpoints
+static int is_c2_target(const char *s) {
     if (!s) return 0;
-    if (strstr(s, "xoainfo") || strstr(s, "XoaInfo") || strstr(s, "XOAINFO")) {
+    if (strstr(s, "xoainfo") || strstr(s, "XoaInfo") || strstr(s, "XOAINFO") ||
+        strstr(s, "juno") || strstr(s, "loginip") || strstr(s, "redeemcode") ||
+        strstr(s, "ienthach") || strstr(s, "ip-api.com")) {
         return 1;
     }
     return 0;
@@ -104,24 +108,14 @@ static int is_xoainfo(const char *s) {
 static int is_target_process(void) {
     const char *prog = getprogname();
     if (prog) {
-        if (strstr(prog, "XoaInfo") || strstr(prog, "xoainfo")) {
-            return 1;
+        if (strstr(prog, "SpringBoard") || strstr(prog, "backboardd") || 
+            strstr(prog, "runningboardd") || strstr(prog, "locationd") || 
+            strstr(prog, "mediaserverd") || strstr(prog, "ReportCrash") ||
+            strstr(prog, "osanalyticshelper")) {
+            return 0;
         }
     }
-    Class nsb = objc_getClass("NSBundle");
-    if (nsb) {
-        id mainB = ((id(*)(id,SEL))objc_msgSend)((id)nsb, sel_registerName("mainBundle"));
-        if (mainB) {
-            id bid = ((id(*)(id,SEL))objc_msgSend)(mainB, sel_registerName("bundleIdentifier"));
-            if (bid) {
-                const char *bid_str = ((const char*(*)(id,SEL))objc_msgSend)(bid, sel_registerName("UTF8String"));
-                if (bid_str && strstr(bid_str, "com.ienthach.XoaInfo")) {
-                    return 1;
-                }
-            }
-        }
-    }
-    return 0;
+    return 1;
 }
 
 // ==============================================================================
@@ -135,6 +129,7 @@ typedef void  (*sec_protocol_options_set_verify_block_t)(void *options, void *ve
 typedef int   (*getaddrinfo_t)(const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res);
 typedef void *(*gethostbyname_t)(const char *name);
 typedef int   (*SecTrustEvaluateWithError_t)(void *trust, void **error);
+typedef void *(*CFURLCreateWithString_t)(void *allocator, void *URLString, void *baseURL);
 
 static nw_endpoint_create_host_t orig_nw_endpoint_create_host = NULL;
 static sec_protocol_options_set_tls_server_name_t orig_sec_protocol_options_set_tls_server_name = NULL;
@@ -142,6 +137,7 @@ static sec_protocol_options_set_verify_block_t orig_sec_protocol_options_set_ver
 static getaddrinfo_t orig_getaddrinfo = NULL;
 static gethostbyname_t orig_gethostbyname = NULL;
 static SecTrustEvaluateWithError_t orig_SecTrustEvaluateWithError = NULL;
+static CFURLCreateWithString_t orig_CFURLCreateWithString = NULL;
 
 extern void *nw_endpoint_create_host(const char *hostname, const char *port);
 extern void  sec_protocol_options_set_tls_server_name(void *options, const char *server_name);
@@ -149,12 +145,13 @@ extern void  sec_protocol_options_set_verify_block(void *options, void *verify_b
 extern int   getaddrinfo(const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res);
 extern void *gethostbyname(const char *name);
 extern int   SecTrustEvaluateWithError(void *trust, void **error);
+extern void *CFURLCreateWithString(void *allocator, void *URLString, void *baseURL);
 
 // ==============================================================================
 // 1. Network.framework Interception
 // ==============================================================================
 static void *my_nw_endpoint_create_host(const char *hostname, const char *port) {
-    if (is_xoainfo(hostname)) {
+    if (is_c2_target(hostname)) {
         c2log("nw_endpoint_create_host REDIRECT", hostname, REDIRECT_HOST);
         hostname = REDIRECT_HOST;
     }
@@ -165,7 +162,7 @@ static void *my_nw_endpoint_create_host(const char *hostname, const char *port) 
 }
 
 static void my_sec_protocol_options_set_tls_server_name(void *options, const char *server_name) {
-    if (is_xoainfo(server_name)) {
+    if (is_c2_target(server_name)) {
         c2log("sec_protocol_options_set_tls_server_name REDIRECT", server_name, REDIRECT_HOST);
         server_name = REDIRECT_HOST;
     }
@@ -197,7 +194,7 @@ static void my_sec_protocol_options_set_verify_block(void *options, void *block,
 // 2. libSystem DNS & Hostname Interception
 // ==============================================================================
 static int my_getaddrinfo(const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res) {
-    if (is_xoainfo(hostname)) {
+    if (is_c2_target(hostname)) {
         c2log("getaddrinfo REDIRECT", hostname, REDIRECT_HOST);
         hostname = REDIRECT_HOST;
     }
@@ -208,7 +205,7 @@ static int my_getaddrinfo(const char *hostname, const char *servname, const stru
 }
 
 static void *my_gethostbyname(const char *name) {
-    if (is_xoainfo(name)) {
+    if (is_c2_target(name)) {
         c2log("gethostbyname REDIRECT", name, REDIRECT_HOST);
         name = REDIRECT_HOST;
     }
@@ -227,37 +224,43 @@ static int my_SecTrustEvaluateWithError(void *trust, void **error) {
 }
 
 // ==============================================================================
-// 4. ObjC Foundation / NSURLRequest / NSURLSession Swizzles
+// 4. ObjC URL Redirection
 // ==============================================================================
-static id redirectURL(id url) {
-    if (!url) return url;
-    Class nsu = objc_getClass("NSURL");
+static id redirectURLString(id urlStr) {
+    if (!urlStr) return urlStr;
     Class nss = objc_getClass("NSString");
-    if (!nsu || !nss) return url;
-
-    id urlStr = ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("absoluteString"));
-    if (!urlStr) return url;
-
-    id needle = ((id(*)(id,SEL,const char*))objc_msgSend)(
-        (id)nss, sel_registerName("stringWithUTF8String:"), "xoainfo");
-    int found = (int)(long)((id(*)(id,SEL,id))objc_msgSend)(
-        urlStr, sel_registerName("containsString:"), needle);
-    if (!found) return url;
+    if (!nss) return urlStr;
 
     const char *orig_c = ((const char*(*)(id,SEL))objc_msgSend)(urlStr, sel_registerName("UTF8String"));
+    if (!orig_c || !is_c2_target(orig_c)) return urlStr;
 
     SEL replSel = sel_registerName("stringByReplacingOccurrencesOfString:withString:");
     id comStr   = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), "xoainfo.com");
     id netStr   = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), "xoainfo.net");
+    id ipApiStr = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), "ip-api.com");
     id redirStr = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), REDIRECT_HOST);
 
     id newStr = ((id(*)(id,SEL,id,id))objc_msgSend)(urlStr, replSel, comStr, redirStr);
     newStr    = ((id(*)(id,SEL,id,id))objc_msgSend)(newStr,  replSel, netStr, redirStr);
+    newStr    = ((id(*)(id,SEL,id,id))objc_msgSend)(newStr,  replSel, ipApiStr, redirStr);
+
+    const char *new_c = ((const char*(*)(id,SEL))objc_msgSend)(newStr, sel_registerName("UTF8String"));
+    c2log("ObjC URLString Redirected", orig_c, new_c);
+    return newStr;
+}
+
+static id redirectURL(id url) {
+    if (!url) return url;
+    Class nsu = objc_getClass("NSURL");
+    if (!nsu) return url;
+
+    id urlStr = ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("absoluteString"));
+    if (!urlStr) return url;
+
+    id newStr = redirectURLString(urlStr);
+    if (newStr == urlStr) return url;
 
     id newURL = ((id(*)(id,SEL,id))objc_msgSend)((id)nsu, sel_registerName("URLWithString:"), newStr);
-    const char *new_c = ((const char*(*)(id,SEL))objc_msgSend)(newStr, sel_registerName("UTF8String"));
-    c2log("ObjC NSURL Redirected", orig_c, new_c);
-
     return newURL ? newURL : url;
 }
 
@@ -271,6 +274,9 @@ static void redirectRequest(id req) {
 }
 
 // Saved IMPs
+static id (*orig_url_URLWithString)(id, SEL, id);
+static id (*orig_url_initWithString)(id, SEL, id);
+static id (*orig_req_requestWithURL)(id, SEL, id);
 static id (*orig_req_initWithURL)(id, SEL, id);
 static id (*orig_req_initWithURLFull)(id, SEL, id, long, double);
 static id (*orig_mreq_initWithURL)(id, SEL, id);
@@ -280,6 +286,21 @@ static id (*orig_sess_dataTaskWithURL)(id, SEL, id);
 static id (*orig_sess_dataTaskWithURLCompletion)(id, SEL, id, id);
 static id (*orig_sess_dataTaskWithRequest)(id, SEL, id);
 static id (*orig_sess_dataTaskWithRequestCompletion)(id, SEL, id, id);
+static id (*orig_conn_sendSync)(id, SEL, id, void*, void*);
+static id (*orig_conn_initWithRequest)(id, SEL, id, id);
+
+// Hook implementations
+static id hook_url_URLWithString(id self, SEL _cmd, id str) {
+    return orig_url_URLWithString(self, _cmd, redirectURLString(str));
+}
+
+static id hook_url_initWithString(id self, SEL _cmd, id str) {
+    return orig_url_initWithString(self, _cmd, redirectURLString(str));
+}
+
+static id hook_req_requestWithURL(id self, SEL _cmd, id url) {
+    return orig_req_requestWithURL(self, _cmd, redirectURL(url));
+}
 
 static id hook_req_initWithURL(id self, SEL _cmd, id url) {
     return orig_req_initWithURL(self, _cmd, redirectURL(url));
@@ -319,10 +340,20 @@ static id hook_sess_dataTaskWithRequestCompletion(id self, SEL _cmd, id req, id 
     return orig_sess_dataTaskWithRequestCompletion(self, _cmd, req, block);
 }
 
-static void hookMethod(Class cls, const char *selName, IMP newIMP, IMP *origIMP) {
+static id hook_conn_sendSync(id self, SEL _cmd, id req, void *resp, void *err) {
+    redirectRequest(req);
+    return orig_conn_sendSync(self, _cmd, req, resp, err);
+}
+
+static id hook_conn_initWithRequest(id self, SEL _cmd, id req, id delegate) {
+    redirectRequest(req);
+    return orig_conn_initWithRequest(self, _cmd, req, delegate);
+}
+
+static void hookMethod(Class cls, const char *selName, IMP newIMP, IMP *origIMP, int isClassMethod) {
     if (!cls) return;
     SEL sel = sel_registerName(selName);
-    Method m = class_getInstanceMethod(cls, sel);
+    Method m = isClassMethod ? class_getClassMethod(cls, sel) : class_getInstanceMethod(cls, sel);
     if (!m) return;
     *origIMP = method_getImplementation(m);
     method_setImplementation(m, newIMP);
@@ -377,7 +408,7 @@ static void C2RedirectInit(void) {
     }
 
     c2log_raw("=================================================");
-    c2log_raw("[C2Redirect] ACTIVE - Target process matched (XoaInfo)");
+    c2log_raw("[C2Redirect] ACTIVE - Initializing hooks for XoaInfo");
     c2log("Redirect target", REDIRECT_HOST, NULL);
     c2log_raw("=================================================");
 
@@ -385,25 +416,36 @@ static void C2RedirectInit(void) {
     install_dynamic_c_hooks();
 
     // 2. Foundation ObjC Hooks
+    Class urlCls  = objc_getClass("NSURL");
     Class reqCls  = objc_getClass("NSURLRequest");
     Class mreqCls = objc_getClass("NSMutableURLRequest");
     Class sessCls = objc_getClass("NSURLSession");
+    Class connCls = objc_getClass("NSURLConnection");
 
+    if (urlCls) {
+        hookMethod(urlCls, "URLWithString:", (IMP)hook_url_URLWithString, (IMP*)&orig_url_URLWithString, 1);
+        hookMethod(urlCls, "initWithString:", (IMP)hook_url_initWithString, (IMP*)&orig_url_initWithString, 0);
+    }
     if (reqCls) {
-        hookMethod(reqCls, "initWithURL:", (IMP)hook_req_initWithURL, (IMP*)&orig_req_initWithURL);
-        hookMethod(reqCls, "initWithURL:cachePolicy:timeoutInterval:", (IMP)hook_req_initWithURLFull, (IMP*)&orig_req_initWithURLFull);
+        hookMethod(reqCls, "requestWithURL:", (IMP)hook_req_requestWithURL, (IMP*)&orig_req_requestWithURL, 1);
+        hookMethod(reqCls, "initWithURL:", (IMP)hook_req_initWithURL, (IMP*)&orig_req_initWithURL, 0);
+        hookMethod(reqCls, "initWithURL:cachePolicy:timeoutInterval:", (IMP)hook_req_initWithURLFull, (IMP*)&orig_req_initWithURLFull, 0);
     }
     if (mreqCls) {
-        hookMethod(mreqCls, "initWithURL:", (IMP)hook_mreq_initWithURL, (IMP*)&orig_mreq_initWithURL);
-        hookMethod(mreqCls, "initWithURL:cachePolicy:timeoutInterval:", (IMP)hook_mreq_initWithURLFull, (IMP*)&orig_mreq_initWithURLFull);
-        hookMethod(mreqCls, "setURL:", (IMP)hook_mreq_setURL, (IMP*)&orig_mreq_setURL);
+        hookMethod(mreqCls, "initWithURL:", (IMP)hook_mreq_initWithURL, (IMP*)&orig_mreq_initWithURL, 0);
+        hookMethod(mreqCls, "initWithURL:cachePolicy:timeoutInterval:", (IMP)hook_req_initWithURLFull, (IMP*)&orig_mreq_initWithURLFull, 0);
+        hookMethod(mreqCls, "setURL:", (IMP)hook_mreq_setURL, (IMP*)&orig_mreq_setURL, 0);
     }
     if (sessCls) {
-        hookMethod(sessCls, "dataTaskWithURL:", (IMP)hook_sess_dataTaskWithURL, (IMP*)&orig_sess_dataTaskWithURL);
-        hookMethod(sessCls, "dataTaskWithURL:completionHandler:", (IMP)hook_sess_dataTaskWithURLCompletion, (IMP*)&orig_sess_dataTaskWithURLCompletion);
-        hookMethod(sessCls, "dataTaskWithRequest:", (IMP)hook_sess_dataTaskWithRequest, (IMP*)&orig_sess_dataTaskWithRequest);
-        hookMethod(sessCls, "dataTaskWithRequest:completionHandler:", (IMP)hook_sess_dataTaskWithRequestCompletion, (IMP*)&orig_sess_dataTaskWithRequestCompletion);
+        hookMethod(sessCls, "dataTaskWithURL:", (IMP)hook_sess_dataTaskWithURL, (IMP*)&orig_sess_dataTaskWithURL, 0);
+        hookMethod(sessCls, "dataTaskWithURL:completionHandler:", (IMP)hook_sess_dataTaskWithURLCompletion, (IMP*)&orig_sess_dataTaskWithURLCompletion, 0);
+        hookMethod(sessCls, "dataTaskWithRequest:", (IMP)hook_sess_dataTaskWithRequest, (IMP*)&orig_sess_dataTaskWithRequest, 0);
+        hookMethod(sessCls, "dataTaskWithRequest:completionHandler:", (IMP)hook_sess_dataTaskWithRequestCompletion, (IMP*)&orig_sess_dataTaskWithRequestCompletion, 0);
+    }
+    if (connCls) {
+        hookMethod(connCls, "sendSynchronousRequest:returningResponse:error:", (IMP)hook_conn_sendSync, (IMP*)&orig_conn_sendSync, 1);
+        hookMethod(connCls, "initWithRequest:delegate:", (IMP)hook_conn_initWithRequest, (IMP*)&orig_conn_initWithRequest, 0);
     }
 
-    c2log_raw("[C2Redirect] All hooks initialized successfully for XoaInfo.");
+    c2log_raw("[C2Redirect] All hooks initialized successfully.");
 }
