@@ -393,14 +393,18 @@ static id build_fake_loginip(id params) {
 
     id plain_str = ((id(*)(id,SEL,id,...))objc_msgSend)((id)objc_getClass("NSString"),
         sel_registerName("stringWithFormat:"),
-        @"expDate:2099-12-31 23:59:59|<>|phase:%s|<>|encrypted:%@|<>|version_run:10|<>|message:Good|<>|retention:%@|<>|deleteList:%@|<>|",
+        @"expDate:2099-12-31|<>|phase:%s|<>|encrypted:%@|<>|version_run:10|<>|message:Good|<>|retention:%@|<>|deleteList:%@|<>|",
         phase_hex,
         obf_b64(BASH, sizeof(BASH)-1),
         obf_b64(RETENTION, sizeof(RETENTION)-1),
         obf_b64(DELFILES, sizeof(DELFILES)-1));
 
     char pw[16]; snprintf(pw, sizeof(pw), "%u", FIXED_LOGINIP_V19);
-    id b64 = local_rncrypt(with_prefix(plain_str), pw);
+    // Do NOT use with_prefix — the client parser splits on |<>| from byte 0;
+    // a 16-byte random prefix would make the first token unparseable.
+    id plain_data = ((id(*)(id,SEL,unsigned long))objc_msgSend)(plain_str,
+        sel_registerName("dataUsingEncoding:"), (unsigned long)4);
+    id b64 = local_rncrypt(plain_data, pw);
     return b64 ? ((id(*)(id,SEL,unsigned long))objc_msgSend)(b64,
         sel_registerName("dataUsingEncoding:"), (unsigned long)4) : nil;
 }
@@ -454,25 +458,79 @@ static id build_fake_team(id params) {
     for (int _i = 0; x_fb_hex[_i]; _i++)
         if (x_fb_hex[_i] >= 'a') x_fb_hex[_i] &= ~0x20;
 
+    // Log what we have so far for diagnosis via: log stream --predicate 'eventMessage contains "C2Redirect"'
+    const char *params_c = params
+        ? ((const char*(*)(id,SEL))objc_msgSend)(params, sel_registerName("UTF8String"))
+        : "(nil)";
+    c2log("TEAM params", params_c, NULL);
+    c2log("TEAM ecid_dec", ecid_dec, NULL);
+    c2log("TEAM X-primary", x_hex, NULL);
+    c2log("TEAM X-fallback", x_fb_hex, NULL);
+
     id va_entries = ((id(*)(id,SEL))objc_msgSend)(
         (id)objc_getClass("NSMutableString"), sel_registerName("string"));
 
-    #define VA_APPEND(fmt_str, ...) \
+    #define VA_APPEND_STR(s) \
         ((void(*)(id,SEL,id,...))objc_msgSend)(va_entries, sel_registerName("appendFormat:"), \
-            @"|<>|versionApp" fmt_str ".expDate:%s", __VA_ARGS__, EXP)
+            @"|<>|versionApp%s.expDate:%s", (s), EXP)
 
-    VA_APPEND("%s", x_hex);    // primary: ecid-derived X
+    VA_APPEND_STR(x_hex);    // primary: ecid-derived X
     if (strcmp(x_hex, x_fb_hex) != 0)
-        VA_APPEND("%s", x_fb_hex); // fallback: constant X (unactivated path)
+        VA_APPEND_STR(x_fb_hex); // fallback: constant X (unactivated path)
 
-    #undef VA_APPEND
+    // Spray: if any request param value is exactly 32 hex chars, echo it back.
+    // The client may send its own pre-computed X in one of the obfuscated fields.
+    if (params) {
+        id amp = ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+            sel_registerName("stringWithUTF8String:"), "&");
+        id eq  = ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+            sel_registerName("stringWithUTF8String:"), "=");
+        id pairs = ((id(*)(id,SEL,id))objc_msgSend)(params,
+            sel_registerName("componentsSeparatedByString:"), amp);
+        unsigned long np = (unsigned long)objc_msgSend(pairs, sel_registerName("count"));
+        for (unsigned long i = 0; i < np; i++) {
+            id pair = ((id(*)(id,SEL,unsigned long))objc_msgSend)(pairs,
+                sel_registerName("objectAtIndex:"), i);
+            id kv = ((id(*)(id,SEL,id))objc_msgSend)(pair,
+                sel_registerName("componentsSeparatedByString:"), eq);
+            if ((unsigned long)objc_msgSend(kv, sel_registerName("count")) < 2) continue;
+            id val = ((id(*)(id,SEL,unsigned long))objc_msgSend)(kv,
+                sel_registerName("objectAtIndex:"), 1UL);
+            unsigned long vlen = (unsigned long)objc_msgSend(val, sel_registerName("length"));
+            if (vlen != 32) continue;
+            const char *vc = ((const char*(*)(id,SEL))objc_msgSend)(val,
+                sel_registerName("UTF8String"));
+            if (!vc) continue;
+            int all_hex = 1;
+            for (int _h = 0; _h < 32; _h++) {
+                char c = vc[_h];
+                if (!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))) {
+                    all_hex = 0; break;
+                }
+            }
+            if (!all_hex) continue;
+            // Uppercase in-place
+            char vu[33];
+            for (int _h = 0; _h < 32; _h++)
+                vu[_h] = (char)(vc[_h] >= 'a' ? (vc[_h] & ~0x20) : vc[_h]);
+            vu[32] = 0;
+            if (strcmp(vu, x_hex) == 0 || strcmp(vu, x_fb_hex) == 0) continue; // already added
+            c2log("TEAM X-from-params", vu, NULL);
+            VA_APPEND_STR(vu);
+        }
+    }
+
+    #undef VA_APPEND_STR
 
     id plain_str = ((id(*)(id,SEL,id,...))objc_msgSend)((id)objc_getClass("NSString"),
         sel_registerName("stringWithFormat:"),
         @"phase:%s|<>|version_run:10|<>|message:Good%@", phase_hex, va_entries);
 
     char pw[16]; snprintf(pw, sizeof(pw), "%d", FIXED_TEAM_V19);
-    id b64 = local_rncrypt(with_prefix(plain_str), pw);
+    // Do NOT use with_prefix — same reason as loginip: prefix corrupts field parsing.
+    id plain_data = ((id(*)(id,SEL,unsigned long))objc_msgSend)(plain_str,
+        sel_registerName("dataUsingEncoding:"), (unsigned long)4);
+    id b64 = local_rncrypt(plain_data, pw);
     return b64 ? ((id(*)(id,SEL,unsigned long))objc_msgSend)(b64,
         sel_registerName("dataUsingEncoding:"), (unsigned long)4) : nil;
 }
