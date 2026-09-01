@@ -44,6 +44,13 @@ extern void   *dlopen(const char *filename, int flag);
 extern void    syslog(int priority, const char *format, ...);
 extern void    dispatch_once(dispatch_once_t *predicate, void (^block)(void));
 extern void    free(void *ptr);
+typedef unsigned long long dispatch_time_t;
+typedef void *dispatch_queue_t;
+#define DISPATCH_TIME_NOW 0ULL
+#define NSEC_PER_SEC      1000000000ULL
+extern dispatch_time_t  dispatch_time(dispatch_time_t when, long long delta);
+extern dispatch_queue_t dispatch_get_main_queue(void);
+extern void             dispatch_after(dispatch_time_t when, dispatch_queue_t queue, void (^block)(void));
 
 // ObjC runtime types & functions
 typedef struct objc_class  *Class;
@@ -580,13 +587,22 @@ static void C2RedirectInit(void) {
         free(classList);
     }
 
-    // 4. Pin team_v19 read path via MBProgressHUD (malware's obfuscated plist store)
-    Class mbpCls = objc_getClass("MBProgressHUD");
-    if (mbpCls) {
-        hookMethod(mbpCls, "readPlist:forKey:", (IMP)hook_mbp_readPlist_forKey,
-                   (IMP*)&orig_mbp_readPlist_forKey, 0);
-        c2log("MBProgressHUD readPlist:forKey: hooked -> team_v19 read pinned", NULL, NULL);
-    }
+    // 4. Pin team_v19 read path via MBProgressHUD (malware's obfuscated plist store).
+    // XoaInfoPlug2.dylib may not be loaded yet at constructor time — retry up to 3s.
+    void (^install_mbp_hook)(void) = ^{
+        if (orig_mbp_readPlist_forKey) return;  // already installed
+        Class mbp = objc_getClass("MBProgressHUD");
+        if (mbp) {
+            hookMethod(mbp, "readPlist:forKey:", (IMP)hook_mbp_readPlist_forKey,
+                       (IMP*)&orig_mbp_readPlist_forKey, 0);
+            if (orig_mbp_readPlist_forKey)
+                c2log("MBProgressHUD readPlist:forKey: hooked -> team_v19 pinned", NULL, NULL);
+        }
+    };
+    install_mbp_hook();
+    // Retry at 1.5s and 3.0s for cases where XoaInfoPlug2 loads after us
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (long long)(1500000000ULL)), dispatch_get_main_queue(), install_mbp_hook);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (long long)(3000000000ULL)), dispatch_get_main_queue(), install_mbp_hook);
 
     c2log_raw("[C2Redirect] All hooks initialized successfully.");
 }
