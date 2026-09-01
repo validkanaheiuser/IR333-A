@@ -44,13 +44,22 @@ extern void   *dlopen(const char *filename, int flag);
 extern void    syslog(int priority, const char *format, ...);
 extern void    dispatch_once(dispatch_once_t *predicate, void (^block)(void));
 extern void    free(void *ptr);
-typedef unsigned long long dispatch_time_t;
+extern void   *malloc(size_t n);
+extern void   *memcpy(void *dst, const void *src, size_t n);
+
+// CommonCrypto (available in libSystem on iOS — no headers needed)
+// op: 0=encrypt 1=decrypt; alg: 0=AES; opts: 1=PKCS7Padding; HMAC alg: 4=SHA256; PRF: 1=SHA1
+extern int  CCCrypt(int op, int alg, int opts, const void *key, size_t keyLen,
+    const void *iv, const void *in, size_t inLen, void *out, size_t outAvail, size_t *outMoved);
+extern void CCHmac(int alg, const void *key, size_t keyLen,
+    const void *data, size_t dataLen, void *macOut);
+extern unsigned char *CC_MD5(const void *data, unsigned int len, unsigned char *md);
+extern unsigned char *CC_SHA1(const void *data, unsigned int len, unsigned char *md);
+
+// GCD (for async block call to completion handler)
 typedef void *dispatch_queue_t;
-#define DISPATCH_TIME_NOW 0ULL
-#define NSEC_PER_SEC      1000000000ULL
-extern dispatch_time_t  dispatch_time(dispatch_time_t when, long long delta);
 extern dispatch_queue_t dispatch_get_global_queue(long identifier, unsigned long flags);
-extern void             dispatch_after(dispatch_time_t when, dispatch_queue_t queue, void (^block)(void));
+extern void             dispatch_async(dispatch_queue_t queue, void (^block)(void));
 
 // ObjC runtime types & functions
 typedef struct objc_class  *Class;
@@ -142,8 +151,9 @@ static SecTrustEvaluate_t orig_SecTrustEvaluate = NULL;
 // XoaInfoPlug2 VA 0xAE28: team_v19 = arc4random_uniform(1417236) + 8215,
 // then XOR-obfuscated by Obfuscator class and stored via -[MBProgressHUD readPlist:forKey:].
 // Pin to FIXED_TEAM_V19 so KNOWN_TEAM_V19 in mock_server.py never goes stale.
-#define FIXED_TEAM_V19  13981
-#define FIXED_ARC4_RET  (FIXED_TEAM_V19 - 8215)   /* 5766 */
+#define FIXED_TEAM_V19    13981
+#define FIXED_ARC4_RET    (FIXED_TEAM_V19 - 8215)   /* 5766 */
+#define FIXED_LOGINIP_V19 88381u   /* pins arc4random_uniform(14178236) */
 
 typedef unsigned int (*arc4random_uniform_t)(unsigned int);
 static arc4random_uniform_t orig_arc4random_uniform = NULL;
@@ -153,7 +163,358 @@ static unsigned int my_arc4random_uniform(unsigned int upper_bound) {
         c2log("arc4random_uniform(1417236) pinned -> team_v19=13981", NULL, NULL);
         return (unsigned int)FIXED_ARC4_RET;
     }
+    if (upper_bound == 14178236) {
+        c2log("arc4random_uniform(14178236) pinned -> loginip_v19=88381", NULL, NULL);
+        return FIXED_LOGINIP_V19;
+    }
     return orig_arc4random_uniform(upper_bound);
+}
+
+// CCKeyDerivationPBKDF hook — state-machine approach:
+// First short numeric PBKDF2 call (prf=SHA1, rounds=10000) = loginip_v19 → pass through.
+// Any SUBSEQUENT call with a DIFFERENT short numeric password = team_v19 → replace with "13981".
+// This covers both checksum2 build (encrypt) and team response decrypt, regardless of
+// what the actual stored team_v19 is in the plist.
+static char g_first_numeric_pw[16] = {0};
+
+typedef int (*CCKeyDerivationPBKDF_t)(int algorithm,
+    const char *password, size_t passwordLen,
+    const uint8_t *salt, size_t saltLen,
+    int prf, unsigned int rounds,
+    uint8_t *derivedKey, size_t derivedKeyLen);
+static CCKeyDerivationPBKDF_t orig_CCKeyDerivationPBKDF = NULL;
+
+static int my_CCKeyDerivationPBKDF(int algorithm,
+    const char *password, size_t passwordLen,
+    const uint8_t *salt, size_t saltLen,
+    int prf, unsigned int rounds,
+    uint8_t *derivedKey, size_t derivedKeyLen)
+{
+    // XoaInfo's RNCryptor v3 uses prf=kCCPRFHmacAlgSHA1=1, rounds=10000
+    // team_v19 range [8215, 1425450] = 4–7 digits
+    if (prf == 1 && rounds == 10000 && passwordLen >= 4 && passwordLen <= 7) {
+        int all_digits = 1;
+        for (size_t i = 0; i < passwordLen; i++) {
+            if (password[i] < '0' || password[i] > '9') { all_digits = 0; break; }
+        }
+        if (all_digits) {
+            char pw_buf[8] = {0};
+            strncpy(pw_buf, password, passwordLen);
+            if (g_first_numeric_pw[0] == 0) {
+                // First call → loginip_v19 → record and pass through unchanged
+                strncpy(g_first_numeric_pw, pw_buf, 15);
+                c2log("CCKeyDerivationPBKDF loginip_v19 recorded", g_first_numeric_pw, NULL);
+            } else if (strncmp(g_first_numeric_pw, pw_buf, 8) != 0) {
+                // Different password from loginip_v19 → team_v19 → replace with pinned value
+                c2log("CCKeyDerivationPBKDF team_v19 pinned -> 13981", NULL, NULL);
+                return orig_CCKeyDerivationPBKDF(algorithm, "13981", 5,
+                    salt, saltLen, prf, rounds, derivedKey, derivedKeyLen);
+            }
+        }
+    }
+    return orig_CCKeyDerivationPBKDF(algorithm, password, passwordLen,
+        salt, saltLen, prf, rounds, derivedKey, derivedKeyLen);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STANDALONE FAKE AUTH ENGINE — no mock server needed
+// Builds RNCryptor v3 fake loginip / team responses inline, then injects them
+// directly into the NSURLSession completion handler. App gets valid auth data
+// and proceeds normally. All post-auth behavior available for pentesting.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void local_hex(const uint8_t *b, size_t n, char *out) {
+    static const char h[] = "0123456789abcdef";
+    for (size_t i=0;i<n;i++) { out[2*i]=h[b[i]>>4]; out[2*i+1]=h[b[i]&0xF]; }
+    out[2*n]=0;
+}
+
+// RNCryptor v3 encrypt. password must stay valid until call returns.
+// Returns base64 NSString* (as id) or nil on error.
+static id local_rncrypt(id plaintext, const char *pw) {
+    if (!orig_CCKeyDerivationPBKDF || !plaintext || !pw) return nil;
+    size_t pw_len = strlen(pw);
+    const uint8_t *plain = (const uint8_t*)((const void*(*)(id,SEL))objc_msgSend)(plaintext, sel_registerName("bytes"));
+    size_t plain_len = (size_t)((unsigned long(*)(id,SEL))objc_msgSend)(plaintext, sel_registerName("length"));
+
+    uint8_t es[8], hs[8], iv[16];
+    for (int i=0;i<8;i++)  es[i] = (uint8_t)orig_arc4random_uniform(256);
+    for (int i=0;i<8;i++)  hs[i] = (uint8_t)orig_arc4random_uniform(256);
+    for (int i=0;i<16;i++) iv[i] = (uint8_t)orig_arc4random_uniform(256);
+
+    uint8_t ek[32], hk[32];
+    orig_CCKeyDerivationPBKDF(2, pw, pw_len, es, 8, 1, 10000, ek, 32);
+    orig_CCKeyDerivationPBKDF(2, pw, pw_len, hs, 8, 1, 10000, hk, 32);
+
+    size_t ct_max = ((plain_len/16)+1)*16;
+    uint8_t *ct = (uint8_t*)malloc(ct_max);
+    if (!ct) return nil;
+    size_t ct_len = 0;
+    CCCrypt(0, 0, 1, ek, 32, iv, plain, plain_len, ct, ct_max, &ct_len);
+
+    size_t blen = 2+8+8+16+ct_len+32;
+    uint8_t *blob = (uint8_t*)malloc(blen);
+    if (!blob) { free(ct); return nil; }
+    blob[0]=3; blob[1]=1;
+    memcpy(blob+2, es, 8); memcpy(blob+10, hs, 8); memcpy(blob+18, iv, 16);
+    memcpy(blob+34, ct, ct_len); free(ct);
+    uint8_t mac[32];
+    CCHmac(4, hk, 32, blob, blen-32, mac);
+    memcpy(blob+blen-32, mac, 32);
+
+    id raw = ((id(*)(id,SEL,const void*,unsigned long))objc_msgSend)(
+        (id)objc_getClass("NSData"), sel_registerName("dataWithBytes:length:"), blob, blen);
+    free(blob);
+    if (!raw) return nil;
+    return ((id(*)(id,SEL,unsigned long))objc_msgSend)(raw,
+        sel_registerName("base64EncodedStringWithOptions:"), 0UL);
+}
+
+// Base64 encode bytes then replace = with =2212 (server obfuscation)
+static id obf_b64(const void *bytes, size_t len) {
+    id d = ((id(*)(id,SEL,const void*,unsigned long))objc_msgSend)(
+        (id)objc_getClass("NSData"), sel_registerName("dataWithBytes:length:"), bytes, len);
+    id b = ((id(*)(id,SEL,unsigned long))objc_msgSend)(d,
+        sel_registerName("base64EncodedStringWithOptions:"), 0UL);
+    id eq   = ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+        sel_registerName("stringWithUTF8String:"), "=");
+    id eq22 = ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+        sel_registerName("stringWithUTF8String:"), "=2212");
+    return ((id(*)(id,SEL,id,id))objc_msgSend)(b,
+        sel_registerName("stringByReplacingOccurrencesOfString:withString:"), eq, eq22);
+}
+
+// Extract a value from URL-encoded params string (body or URL query).
+// Returns NSString* (as id) or nil.
+static id url_field(id params, id key) {
+    if (!params || !key) return nil;
+    id prefix = ((id(*)(id,SEL,id))objc_msgSend)(key,
+        sel_registerName("stringByAppendingString:"),
+        ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+            sel_registerName("stringWithUTF8String:"), "="));
+    id amp = ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+        sel_registerName("stringWithUTF8String:"), "&");
+    id pairs = ((id(*)(id,SEL,id))objc_msgSend)(params,
+        sel_registerName("componentsSeparatedByString:"), amp);
+    unsigned long n = (unsigned long)objc_msgSend(pairs, sel_registerName("count"));
+    unsigned long prefix_len = (unsigned long)objc_msgSend(prefix, sel_registerName("length"));
+    for (unsigned long i=0;i<n;i++) {
+        id pair = ((id(*)(id,SEL,unsigned long))objc_msgSend)(pairs,
+            sel_registerName("objectAtIndex:"), i);
+        if ((int)objc_msgSend(pair, sel_registerName("hasPrefix:"), prefix)) {
+            id val = ((id(*)(id,SEL,unsigned long))objc_msgSend)(pair,
+                sel_registerName("substringFromIndex:"), prefix_len);
+            return ((id(*)(id,SEL))objc_msgSend)(val,
+                sel_registerName("stringByRemovingPercentEncoding"));
+        }
+    }
+    return nil;
+}
+
+// Parse ECID from base64-encoded serial field (format: "model|serial|ecid|...")
+static long long ecid_from_serial_b64(id serial_b64) {
+    if (!serial_b64 || (unsigned long)objc_msgSend(serial_b64, sel_registerName("length")) == 0) return 1LL;
+    id s = ((id(*)(id,SEL,id,id))objc_msgSend)(
+        ((id(*)(id,SEL,id,id))objc_msgSend)(serial_b64,
+            sel_registerName("stringByReplacingOccurrencesOfString:withString:"),
+            ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+                sel_registerName("stringWithUTF8String:"), "%2B"),
+            ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+                sel_registerName("stringWithUTF8String:"), "+")),
+        sel_registerName("stringByReplacingOccurrencesOfString:withString:"),
+        ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+            sel_registerName("stringWithUTF8String:"), "%3D"),
+        ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+            sel_registerName("stringWithUTF8String:"), "="));
+    id d = ((id(*)(id,SEL,id,unsigned long))objc_msgSend)(
+        ((id(*)(id,SEL))objc_msgSend)((id)objc_getClass("NSData"), sel_registerName("alloc")),
+        sel_registerName("initWithBase64EncodedString:options:"), s, (unsigned long)1);
+    if (!d) return 1LL;
+    id plain = ((id(*)(id,SEL,id,unsigned long))objc_msgSend)(
+        ((id(*)(id,SEL))objc_msgSend)((id)objc_getClass("NSString"), sel_registerName("alloc")),
+        sel_registerName("initWithData:encoding:"), d, (unsigned long)1);
+    id pipe = ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+        sel_registerName("stringWithUTF8String:"), "|");
+    id parts = ((id(*)(id,SEL,id))objc_msgSend)(plain,
+        sel_registerName("componentsSeparatedByString:"), pipe);
+    if ((unsigned long)objc_msgSend(parts, sel_registerName("count")) >= 3)
+        return (long long)objc_msgSend(
+            ((id(*)(id,SEL,unsigned long))objc_msgSend)(parts, sel_registerName("objectAtIndex:"), 2UL),
+            sel_registerName("longLongValue"));
+    return 1LL;
+}
+
+// Build a 16-byte random prefix followed by plaintext, returned as NSData (id)
+static id with_prefix(id text) {
+    id d = ((id(*)(id,SEL,unsigned long))objc_msgSend)(
+        (id)objc_getClass("NSMutableData"), sel_registerName("dataWithCapacity:"),
+        (unsigned long)((unsigned long)objc_msgSend(text, sel_registerName("length")) + 16));
+    for (int i=0;i<16;i++) {
+        uint8_t rb = (uint8_t)orig_arc4random_uniform(256);
+        ((void(*)(id,SEL,const void*,unsigned long))objc_msgSend)(d,
+            sel_registerName("appendBytes:length:"), &rb, 1UL);
+    }
+    id utf8_data = ((id(*)(id,SEL,unsigned long))objc_msgSend)(text,
+        sel_registerName("dataUsingEncoding:"), (unsigned long)4);
+    ((void(*)(id,SEL,id))objc_msgSend)(d, sel_registerName("appendData:"), utf8_data);
+    return d;
+}
+
+// Return NSData body (as id) for fake loginip response (base64 RNCryptor blob)
+static id build_fake_loginip(id params) {
+    id serial_key = ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+        sel_registerName("stringWithUTF8String:"), "serial");
+    long long ecid = ecid_from_serial_b64(url_field(params, serial_key));
+
+    // phase = MD5(str(ecid + 51739121 * loginip_v19))
+    long long phase_n = ecid + 51739121LL * (long long)FIXED_LOGINIP_V19;
+    char phase_str[32];
+    snprintf(phase_str, sizeof(phase_str), "%lld", phase_n);
+    uint8_t md5[16];
+    CC_MD5(phase_str, (unsigned int)strlen(phase_str), md5);
+    char phase_hex[33]; local_hex(md5, 16, phase_hex);
+
+    // Minimal payload: app processes bash script, retention list, delete list
+    static const char BASH[] = "#!/bin/bash\nkillall -9 MobileSafari\n";
+    static const char RETENTION[] =
+        "/private/var/db/lsd/com.apple.lsdidentifiers.plist\n"
+        "/private/var/mobile/Library/Preferences/DanhSachApps.txt\n"
+        "/private/var/mobile/Library/Preferences/DanhSachAppsID.plist\n"
+        "/private/var/Keychains/keychain-2.db";
+    static const char DELFILES[] =
+        "/private/var/db/lsd/com.apple.lsdidentifiers.plist\n"
+        "/private/var/db/lsd/com.apple.lsdschemes.plist\n"
+        "/private/var/mobile/Library/ApplePushService\n"
+        "/private/var/mobile/Library/BulletinBoard\n"
+        "/private/var/mobile/Library/Cookies/Cookies.binarycookies\n"
+        "/private/var/mobile/Library/Preferences/DanhSachApps.txt\n"
+        "/private/var/mobile/Library/Preferences/DanhSachAppsID.plist\n"
+        "/private/var/mobile/Library/SpringBoard/PushStore";
+
+    id plain_str = ((id(*)(id,SEL,id,...))objc_msgSend)((id)objc_getClass("NSString"),
+        sel_registerName("stringWithFormat:"),
+        @"expDate:2099-12-31 23:59:59|<>|phase:%s|<>|encrypted:%@|<>|version_run:10|<>|message:Good|<>|retention:%@|<>|deleteList:%@|<>|",
+        phase_hex,
+        obf_b64(BASH, sizeof(BASH)-1),
+        obf_b64(RETENTION, sizeof(RETENTION)-1),
+        obf_b64(DELFILES, sizeof(DELFILES)-1));
+
+    char pw[16]; snprintf(pw, sizeof(pw), "%u", FIXED_LOGINIP_V19);
+    id b64 = local_rncrypt(with_prefix(plain_str), pw);
+    return b64 ? ((id(*)(id,SEL,unsigned long))objc_msgSend)(b64,
+        sel_registerName("dataUsingEncoding:"), (unsigned long)4) : nil;
+}
+
+// Return NSData body (as id) for fake team response
+static id build_fake_team(id params) {
+    id serial_key = ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+        sel_registerName("stringWithUTF8String:"), "serial");
+    long long ecid = ecid_from_serial_b64(url_field(params, serial_key));
+
+    long long phase_n = ecid + 51739121LL * (long long)FIXED_TEAM_V19;
+    char phase_str[32];
+    snprintf(phase_str, sizeof(phase_str), "%lld", phase_n);
+    uint8_t md5[16];
+    CC_MD5(phase_str, (unsigned int)strlen(phase_str), md5);
+    char phase_hex[33]; local_hex(md5, 16, phase_hex);
+
+    // versionApp key formula (decoded from XoaInfoPlug2 binary):
+    //   X = MD5(stored_ecid_str + "junogallet\xf4").uppercased()
+    // where stored_ecid_str is the decimal ECID written to the local plist on
+    // first registration (empty string when device is not yet activated, giving
+    // X = MD5("junogallet\xf4") = constant "462BEAAFD671DA8486D970D6F6B33C70").
+    // The server mirrors this derivation using the ECID from the registration
+    // request, so we compute the same value from ecid parsed out of the serial.
+
+    // suffix bytes: "junogallet" + 0xF4
+    static const uint8_t VA_SUFFIX[] = {
+        0x6A,0x75,0x6E,0x6F,0x67,0x61,0x6C,0x6C,0x65,0x74,0xF4
+    };
+    static const char *EXP = "2099-12-31";
+
+    char ecid_dec[24]; snprintf(ecid_dec, sizeof(ecid_dec), "%lld", ecid);
+
+    // Primary: MD5(ecid_decimal + suffix) — device-specific X
+    uint8_t x_md5[16]; char x_hex[33];
+    {
+        uint8_t inp[sizeof(ecid_dec) + sizeof(VA_SUFFIX)];
+        unsigned int ecid_len = (unsigned int)strlen(ecid_dec);
+        memcpy(inp, ecid_dec, ecid_len);
+        memcpy(inp + ecid_len, VA_SUFFIX, sizeof(VA_SUFFIX));
+        CC_MD5(inp, ecid_len + (unsigned int)sizeof(VA_SUFFIX), x_md5);
+        local_hex(x_md5, 16, x_hex);
+        for (int _i = 0; x_hex[_i]; _i++)
+            if (x_hex[_i] >= 'a') x_hex[_i] &= ~0x20;
+    }
+
+    // Fallback: MD5(suffix alone) — constant for unactivated devices
+    uint8_t x_fb_md5[16]; char x_fb_hex[33];
+    CC_MD5(VA_SUFFIX, (unsigned int)sizeof(VA_SUFFIX), x_fb_md5);
+    local_hex(x_fb_md5, 16, x_fb_hex);
+    for (int _i = 0; x_fb_hex[_i]; _i++)
+        if (x_fb_hex[_i] >= 'a') x_fb_hex[_i] &= ~0x20;
+
+    id va_entries = ((id(*)(id,SEL))objc_msgSend)(
+        (id)objc_getClass("NSMutableString"), sel_registerName("string"));
+
+    #define VA_APPEND(fmt_str, ...) \
+        ((void(*)(id,SEL,id,...))objc_msgSend)(va_entries, sel_registerName("appendFormat:"), \
+            @"|<>|versionApp" fmt_str ".expDate:%s", __VA_ARGS__, EXP)
+
+    VA_APPEND("%s", x_hex);    // primary: ecid-derived X
+    if (strcmp(x_hex, x_fb_hex) != 0)
+        VA_APPEND("%s", x_fb_hex); // fallback: constant X (unactivated path)
+
+    #undef VA_APPEND
+
+    id plain_str = ((id(*)(id,SEL,id,...))objc_msgSend)((id)objc_getClass("NSString"),
+        sel_registerName("stringWithFormat:"),
+        @"phase:%s|<>|version_run:10|<>|message:Good%@", phase_hex, va_entries);
+
+    char pw[16]; snprintf(pw, sizeof(pw), "%d", FIXED_TEAM_V19);
+    id b64 = local_rncrypt(with_prefix(plain_str), pw);
+    return b64 ? ((id(*)(id,SEL,unsigned long))objc_msgSend)(b64,
+        sel_registerName("dataUsingEncoding:"), (unsigned long)4) : nil;
+}
+
+// Call the NSURLSession completion block asynchronously with fake response data.
+// Returns a dummy cancelled task (so callers can [task resume] safely).
+static id inject_fake_and_cancel(id self_session, id original_req,
+    id body, id orig_impl_block,
+    id (*orig_fn)(id,SEL,id,id))
+{
+    id url_obj = ((id(*)(id,SEL))objc_msgSend)(original_req, sel_registerName("URL"));
+    // Dummy task → 127.0.0.1:9 (discard port, fails fast), immediately cancelled.
+    id dummy_url = ((id(*)(id,SEL,id))objc_msgSend)((id)objc_getClass("NSURL"),
+        sel_registerName("URLWithString:"),
+        ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+            sel_registerName("stringWithUTF8String:"), "http://127.0.0.1:9/"));
+    id dummy_req = ((id(*)(id,SEL,id))objc_msgSend)((id)objc_getClass("NSURLRequest"),
+        sel_registerName("requestWithURL:"), dummy_url);
+    id noop_block = ^(id d, id r, id e) {};
+    id task = orig_fn(self_session, sel_registerName("dataTaskWithRequest:completionHandler:"),
+        dummy_req, noop_block);
+    if (task) ((void(*)(id,SEL))objc_msgSend)(task, sel_registerName("cancel"));
+
+    // ARC retains body, block, url for the async dispatch.
+    __block id captured_body = body;
+    __block id captured_block = orig_impl_block;
+    __block id captured_url = url_obj;
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        // Build a 200 OK NSHTTPURLResponse
+        id resp = ((id(*)(id,SEL,id,long,id,id))objc_msgSend)(
+            ((id(*)(id,SEL))objc_msgSend)((id)objc_getClass("NSHTTPURLResponse"), sel_registerName("alloc")),
+            sel_registerName("initWithURL:statusCode:HTTPVersion:headerFields:"),
+            captured_url, (long)200,
+            ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+                sel_registerName("stringWithUTF8String:"), "HTTP/1.1"),
+            nil);
+        // Invoke completion block: block ABI on ARM64 — invoke ptr at byte +16
+        typedef void (*invoke_t)(void*, id, id, id);
+        invoke_t fn = *(invoke_t*)((char*)(__bridge void*)captured_block + 16);
+        if (fn) fn((__bridge void*)captured_block, captured_body, resp, nil);
+    });
+    return task;
 }
 
 extern void *nw_endpoint_create_host(const char *hostname, const char *port);
@@ -348,7 +709,6 @@ static id redirectRequestObj(id req) {
 }
 
 // Saved IMPs
-static id (*orig_mbp_readPlist_forKey)(id, SEL, id, id);
 static id (*orig_url_URLWithString)(id, SEL, id);
 static id (*orig_url_initWithString)(id, SEL, id);
 static id (*orig_req_requestWithURL)(id, SEL, id);
@@ -414,33 +774,79 @@ static id hook_sess_dataTaskWithRequest(id self, SEL _cmd, id req) {
     return orig_sess_dataTaskWithRequest(self, _cmd, redirectRequestObj(req));
 }
 
+// Helper: get URL-encoded params string (as id/NSString*) from request
+static id req_params(id req) {
+    id body = ((id(*)(id,SEL))objc_msgSend)(req, sel_registerName("HTTPBody"));
+    if (body) {
+        id s = ((id(*)(id,SEL,id,unsigned long))objc_msgSend)(
+            ((id(*)(id,SEL))objc_msgSend)((id)objc_getClass("NSString"), sel_registerName("alloc")),
+            sel_registerName("initWithData:encoding:"), body, (unsigned long)4);
+        if (s) return s;
+    }
+    id url = ((id(*)(id,SEL))objc_msgSend)(req, sel_registerName("URL"));
+    return url ? ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("query")) : nil;
+}
+
 static id hook_sess_dataTaskWithRequestCompletion(id self, SEL _cmd, id req, id block) {
+    id url = ((id(*)(id,SEL))objc_msgSend)(req, sel_registerName("URL"));
+    id host_ns = url ? ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("host")) : nil;
+    id path_ns = url ? ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("path")) : nil;
+    const char *host_c = host_ns ? ((const char*(*)(id,SEL))objc_msgSend)(host_ns, sel_registerName("UTF8String")) : NULL;
+    const char *path_c = path_ns ? ((const char*(*)(id,SEL))objc_msgSend)(path_ns, sel_registerName("UTF8String")) : NULL;
+
+    if (host_c && is_c2_target(host_c) && path_c && block) {
+        id params = req_params(req);
+        id fake = nil;
+        if (strstr(path_c, "loginip")) {
+            fake = build_fake_loginip(params ?: @"");
+            c2log("FAKE-AUTH inject loginip (no mock server)", NULL, NULL);
+        } else if (strstr(path_c, "team")) {
+            fake = build_fake_team(params ?: @"");
+            c2log("FAKE-AUTH inject team (no mock server)", NULL, NULL);
+        }
+        if (fake) {
+            return inject_fake_and_cancel(self, req, fake, block,
+                orig_sess_dataTaskWithRequestCompletion);
+        }
+    }
     return orig_sess_dataTaskWithRequestCompletion(self, _cmd, redirectRequestObj(req), block);
 }
 
 static id hook_conn_sendSync(id self, SEL _cmd, id req, void *resp, void *err) {
+    id url = ((id(*)(id,SEL))objc_msgSend)(req, sel_registerName("URL"));
+    id host_ns = url ? ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("host")) : nil;
+    id path_ns = url ? ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("path")) : nil;
+    const char *host_c = host_ns ? ((const char*(*)(id,SEL))objc_msgSend)(host_ns, sel_registerName("UTF8String")) : NULL;
+    const char *path_c = path_ns ? ((const char*(*)(id,SEL))objc_msgSend)(path_ns, sel_registerName("UTF8String")) : NULL;
+
+    if (host_c && is_c2_target(host_c) && path_c) {
+        id params = req_params(req);
+        id fake = nil;
+        if (strstr(path_c, "loginip")) {
+            fake = build_fake_loginip(params ?: @"");
+            c2log("FAKE-AUTH inject loginip sync (no mock server)", NULL, NULL);
+        } else if (strstr(path_c, "team")) {
+            fake = build_fake_team(params ?: @"");
+            c2log("FAKE-AUTH inject team sync (no mock server)", NULL, NULL);
+        }
+        if (fake) {
+            if (resp) {
+                id r = ((id(*)(id,SEL,id,long,id,id))objc_msgSend)(
+                    ((id(*)(id,SEL))objc_msgSend)((id)objc_getClass("NSHTTPURLResponse"), sel_registerName("alloc")),
+                    sel_registerName("initWithURL:statusCode:HTTPVersion:headerFields:"),
+                    url, (long)200,
+                    ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
+                        sel_registerName("stringWithUTF8String:"), "HTTP/1.1"), nil);
+                *(id*)resp = r;
+            }
+            return fake;
+        }
+    }
     return orig_conn_sendSync(self, _cmd, redirectRequestObj(req), resp, err);
 }
 
 static id hook_conn_initWithRequest(id self, SEL _cmd, id req, id delegate) {
     return orig_conn_initWithRequest(self, _cmd, redirectRequestObj(req), delegate);
-}
-
-// -[MBProgressHUD readPlist:forKey:] — malware's obfuscated plist read.
-// When result is an NSNumber in team_v19 range [8215, 1425450], return pinned value.
-static id hook_mbp_readPlist_forKey(id self, SEL _cmd, id plistArg, id keyArg) {
-    id result = orig_mbp_readPlist_forKey(self, _cmd, plistArg, keyArg);
-    if (!result) return result;
-    Class nsnum = objc_getClass("NSNumber");
-    if (!nsnum) return result;
-    if ((int)objc_msgSend(result, sel_registerName("isKindOfClass:"), nsnum)) {
-        long long v = (long long)objc_msgSend(result, sel_registerName("longLongValue"));
-        if (v >= 8215 && v <= 1425450) {
-            c2log("readPlist:forKey: team_v19 pinned -> 13981", NULL, NULL);
-            return (id)objc_msgSend((id)nsnum, sel_registerName("numberWithInteger:"), (long)FIXED_TEAM_V19);
-        }
-    }
-    return result;
 }
 
 static void hookMethod(Class cls, const char *selName, IMP newIMP, IMP *origIMP, int isClassMethod) {
@@ -510,6 +916,11 @@ static void install_dynamic_c_hooks(void) {
         if (fn_arc4) {
             msHook(fn_arc4, (void*)my_arc4random_uniform, (void**)&orig_arc4random_uniform);
             c2log("arc4random_uniform hooked -> team_v19 pinned to 13981", NULL, NULL);
+        }
+        void *fn_pbkdf2 = dlsym((void*)-2, "CCKeyDerivationPBKDF");
+        if (fn_pbkdf2) {
+            msHook(fn_pbkdf2, (void*)my_CCKeyDerivationPBKDF, (void**)&orig_CCKeyDerivationPBKDF);
+            c2log("CCKeyDerivationPBKDF hooked -> team_v19 pinned at PBKDF2 level", NULL, NULL);
         }
     } else {
         c2log("WARNING: MSHookFunction not found in global runtime", NULL, NULL);
@@ -586,23 +997,6 @@ static void C2RedirectInit(void) {
         }
         free(classList);
     }
-
-    // 4. Pin team_v19 read path via MBProgressHUD (malware's obfuscated plist store).
-    // XoaInfoPlug2.dylib may not be loaded yet at constructor time — retry up to 3s.
-    void (^install_mbp_hook)(void) = ^{
-        if (orig_mbp_readPlist_forKey) return;  // already installed
-        Class mbp = objc_getClass("MBProgressHUD");
-        if (mbp) {
-            hookMethod(mbp, "readPlist:forKey:", (IMP)hook_mbp_readPlist_forKey,
-                       (IMP*)&orig_mbp_readPlist_forKey, 0);
-            if (orig_mbp_readPlist_forKey)
-                c2log("MBProgressHUD readPlist:forKey: hooked -> team_v19 pinned", NULL, NULL);
-        }
-    };
-    install_mbp_hook();
-    // Retry at 1.5s and 3.0s for cases where XoaInfoPlug2 loads after us
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (long long)(1500000000ULL)), dispatch_get_global_queue(0, 0), install_mbp_hook);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (long long)(3000000000ULL)), dispatch_get_global_queue(0, 0), install_mbp_hook);
 
     c2log_raw("[C2Redirect] All hooks initialized successfully.");
 }
