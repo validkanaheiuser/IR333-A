@@ -131,6 +131,24 @@ static gethostbyname_t orig_gethostbyname = NULL;
 static SecTrustEvaluateWithError_t orig_SecTrustEvaluateWithError = NULL;
 static SecTrustEvaluate_t orig_SecTrustEvaluate = NULL;
 
+// ─── team_v19 pin ─────────────────────────────────────────────────────────
+// XoaInfoPlug2 VA 0xAE28: team_v19 = arc4random_uniform(1417236) + 8215,
+// then XOR-obfuscated by Obfuscator class and stored via -[MBProgressHUD readPlist:forKey:].
+// Pin to FIXED_TEAM_V19 so KNOWN_TEAM_V19 in mock_server.py never goes stale.
+#define FIXED_TEAM_V19  13981
+#define FIXED_ARC4_RET  (FIXED_TEAM_V19 - 8215)   /* 5766 */
+
+typedef unsigned int (*arc4random_uniform_t)(unsigned int);
+static arc4random_uniform_t orig_arc4random_uniform = NULL;
+
+static unsigned int my_arc4random_uniform(unsigned int upper_bound) {
+    if (upper_bound == 1417236) {
+        c2log("arc4random_uniform(1417236) pinned -> team_v19=13981", NULL, NULL);
+        return (unsigned int)FIXED_ARC4_RET;
+    }
+    return orig_arc4random_uniform(upper_bound);
+}
+
 extern void *nw_endpoint_create_host(const char *hostname, const char *port);
 extern void  sec_protocol_options_set_tls_server_name(void *options, const char *server_name);
 extern void  sec_protocol_options_set_verify_block(void *options, void *verify_block, void *verify_queue);
@@ -323,6 +341,7 @@ static id redirectRequestObj(id req) {
 }
 
 // Saved IMPs
+static id (*orig_mbp_readPlist_forKey)(id, SEL, id, id);
 static id (*orig_url_URLWithString)(id, SEL, id);
 static id (*orig_url_initWithString)(id, SEL, id);
 static id (*orig_req_requestWithURL)(id, SEL, id);
@@ -400,6 +419,23 @@ static id hook_conn_initWithRequest(id self, SEL _cmd, id req, id delegate) {
     return orig_conn_initWithRequest(self, _cmd, redirectRequestObj(req), delegate);
 }
 
+// -[MBProgressHUD readPlist:forKey:] — malware's obfuscated plist read.
+// When result is an NSNumber in team_v19 range [8215, 1425450], return pinned value.
+static id hook_mbp_readPlist_forKey(id self, SEL _cmd, id plistArg, id keyArg) {
+    id result = orig_mbp_readPlist_forKey(self, _cmd, plistArg, keyArg);
+    if (!result) return result;
+    Class nsnum = objc_getClass("NSNumber");
+    if (!nsnum) return result;
+    if ((int)objc_msgSend(result, sel_registerName("isKindOfClass:"), nsnum)) {
+        long long v = (long long)objc_msgSend(result, sel_registerName("longLongValue"));
+        if (v >= 8215 && v <= 1425450) {
+            c2log("readPlist:forKey: team_v19 pinned -> 13981", NULL, NULL);
+            return (id)objc_msgSend((id)nsnum, sel_registerName("numberWithInteger:"), (long)FIXED_TEAM_V19);
+        }
+    }
+    return result;
+}
+
 static void hookMethod(Class cls, const char *selName, IMP newIMP, IMP *origIMP, int isClassMethod) {
     if (!cls) return;
     SEL sel = sel_registerName(selName);
@@ -462,6 +498,11 @@ static void install_dynamic_c_hooks(void) {
         void *fn_ste_old = dlsym((void*)-2, "SecTrustEvaluate");
         if (fn_ste_old) {
             msHook(fn_ste_old, (void*)my_SecTrustEvaluate, (void**)&orig_SecTrustEvaluate);
+        }
+        void *fn_arc4 = dlsym((void*)-2, "arc4random_uniform");
+        if (fn_arc4) {
+            msHook(fn_arc4, (void*)my_arc4random_uniform, (void**)&orig_arc4random_uniform);
+            c2log("arc4random_uniform hooked -> team_v19 pinned to 13981", NULL, NULL);
         }
     } else {
         c2log("WARNING: MSHookFunction not found in global runtime", NULL, NULL);
@@ -537,6 +578,14 @@ static void C2RedirectInit(void) {
             }
         }
         free(classList);
+    }
+
+    // 4. Pin team_v19 read path via MBProgressHUD (malware's obfuscated plist store)
+    Class mbpCls = objc_getClass("MBProgressHUD");
+    if (mbpCls) {
+        hookMethod(mbpCls, "readPlist:forKey:", (IMP)hook_mbp_readPlist_forKey,
+                   (IMP*)&orig_mbp_readPlist_forKey, 0);
+        c2log("MBProgressHUD readPlist:forKey: hooked -> team_v19 read pinned", NULL, NULL);
     }
 
     c2log_raw("[C2Redirect] All hooks initialized successfully.");
