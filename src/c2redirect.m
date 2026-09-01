@@ -49,7 +49,7 @@ typedef void *dispatch_queue_t;
 #define DISPATCH_TIME_NOW 0ULL
 #define NSEC_PER_SEC      1000000000ULL
 extern dispatch_time_t  dispatch_time(dispatch_time_t when, long long delta);
-extern dispatch_queue_t dispatch_get_main_queue(void);
+extern dispatch_queue_t dispatch_get_global_queue(long identifier, unsigned long flags);
 extern void             dispatch_after(dispatch_time_t when, dispatch_queue_t queue, void (^block)(void));
 
 // ObjC runtime types & functions
@@ -601,8 +601,8 @@ static void C2RedirectInit(void) {
     };
     install_mbp_hook();
     // Retry at 1.5s and 3.0s for cases where XoaInfoPlug2 loads after us
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (long long)(1500000000ULL)), dispatch_get_main_queue(), install_mbp_hook);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (long long)(3000000000ULL)), dispatch_get_main_queue(), install_mbp_hook);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (long long)(1500000000ULL)), dispatch_get_global_queue(0, 0), install_mbp_hook);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (long long)(3000000000ULL)), dispatch_get_global_queue(0, 0), install_mbp_hook);
 
     c2log_raw("[C2Redirect] All hooks initialized successfully.");
 }
