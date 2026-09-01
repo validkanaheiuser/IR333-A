@@ -837,7 +837,7 @@ static id hook_conn_sendSync(id self, SEL _cmd, id req, void *resp, void *err) {
                     url, (long)200,
                     ((id(*)(id,SEL,const char*))objc_msgSend)((id)objc_getClass("NSString"),
                         sel_registerName("stringWithUTF8String:"), "HTTP/1.1"), nil);
-                *(id*)resp = r;
+                *(__unsafe_unretained id*)resp = r;
             }
             return fake;
         }
