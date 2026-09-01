@@ -238,6 +238,10 @@ static BOOL hook_tlsVerified(id self, SEL _cmd) {
 // ==============================================================================
 // 5. ObjC URL & Host Header Redirection (Fixes Cloudflare 403 Host Mismatch)
 // ==============================================================================
+
+// Forward declaration — defined in "Saved IMPs" section below
+static id (*orig_url_URLWithString)(id, SEL, id);
+
 static id redirectURLString(id urlStr) {
     if (!urlStr) return urlStr;
     Class nss = objc_getClass("NSString");
@@ -251,7 +255,10 @@ static id redirectURLString(id urlStr) {
     SEL replSel = sel_registerName("stringByReplacingOccurrencesOfString:withString:");
     id redirStr = ((id(*)(id,SEL,const char*))objc_msgSend)((id)nss, sel_registerName("stringWithUTF8String:"), REDIRECT_HOST);
 
-    id tempURL = ((id(*)(id,SEL,id))objc_msgSend)((id)nsu, sel_registerName("URLWithString:"), urlStr);
+    // Use orig (un-hooked) URLWithString to avoid infinite recursion via our own hook
+    id tempURL = orig_url_URLWithString
+        ? orig_url_URLWithString((id)nsu, sel_registerName("URLWithString:"), urlStr)
+        : NULL;
     id currentStr = urlStr;
     if (tempURL) {
         id host = ((id(*)(id,SEL))objc_msgSend)(tempURL, sel_registerName("host"));
