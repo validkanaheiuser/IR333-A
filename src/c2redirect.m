@@ -180,40 +180,47 @@ static char g_x_pool[X_POOL_MAX][33];  // each entry: 32 lowercase hex + NUL
 static int  g_x_pool_n = 0;
 
 static void x_pool_add(const char *hex32) {
-    // deduplicate
     for (int _p = 0; _p < g_x_pool_n; _p++)
         if (strcmp(g_x_pool[_p], hex32) == 0) return;
     if (g_x_pool_n < X_POOL_MAX) {
         for (int _c = 0; _c < 32; _c++) g_x_pool[g_x_pool_n][_c] = hex32[_c];
         g_x_pool[g_x_pool_n][32] = 0;
         g_x_pool_n++;
-        c2log("CC_MD5 pool+", hex32, NULL);
+        // Log outside the hook (no syslog in hot path)
     }
 }
 
 typedef unsigned char *(*CC_MD5_t)(const void *, unsigned int, unsigned char *);
 static CC_MD5_t orig_CC_MD5_hook = NULL;
+
+// Thread-local reentrancy guard — prevents syslog or other callees
+// from re-entering the hook if they themselves call CC_MD5.
+static _Thread_local int g_md5_in_hook = 0;
+
 static unsigned char *my_CC_MD5(const void *data, unsigned int len, unsigned char *md) {
+    if (g_md5_in_hook) return orig_CC_MD5_hook(data, len, md);
+    g_md5_in_hook = 1;
+
     unsigned char *ret = orig_CC_MD5_hook(data, len, md);
-    if (data && len >= 4 && len <= 128) {
+
+    // Only capture: printable ASCII, 8–64 bytes (device-id range).
+    // No syslog here — logging happens later in build_fake_team.
+    if (data && len >= 8 && len <= 64 && md) {
         const unsigned char *p = (const unsigned char *)data;
         int printable = 1;
         for (unsigned int i = 0; i < len; i++) {
             if (p[i] < 0x20 || p[i] > 0x7E) { printable = 0; break; }
         }
-        if (printable && md) {
-            char inp[129] = {0};
-            unsigned int copy = len < 128 ? len : 127;
-            __builtin_memcpy(inp, data, copy);
+        if (printable) {
             static const char _hx[] = "0123456789abcdef";
             char out_hex[33];
             for (int _i=0;_i<16;_i++){out_hex[2*_i]=_hx[md[_i]>>4];out_hex[2*_i+1]=_hx[md[_i]&0xF];}
             out_hex[32]=0;
-            c2log("CC_MD5 input", inp, NULL);
-            c2log("CC_MD5 output", out_hex, NULL);
             x_pool_add(out_hex);
         }
     }
+
+    g_md5_in_hook = 0;
     return ret;
 }
 
