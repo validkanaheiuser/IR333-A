@@ -170,8 +170,27 @@ static unsigned int my_arc4random_uniform(unsigned int upper_bound) {
     return orig_arc4random_uniform(upper_bound);
 }
 
-// CC_MD5 diagnostic hook — logs all MD5 inputs/outputs so we can find the X formula.
-// Filter: only log when input is printable ASCII (strips crypto noise).
+// CC_MD5 hook — two jobs:
+//   1. Log every call with printable-ASCII input for diagnosis.
+//   2. Pool all MD5 outputs. build_fake_team() sprays the pool as versionApp{X}.expDate
+//      candidates so XoaInfoPlug2 always finds the right X — even though X is computed
+//      AFTER the response is sent (timing solved by capture-on-first-run, use-on-retry).
+#define X_POOL_MAX 16
+static char g_x_pool[X_POOL_MAX][33];  // each entry: 32 lowercase hex + NUL
+static int  g_x_pool_n = 0;
+
+static void x_pool_add(const char *hex32) {
+    // deduplicate
+    for (int _p = 0; _p < g_x_pool_n; _p++)
+        if (strcmp(g_x_pool[_p], hex32) == 0) return;
+    if (g_x_pool_n < X_POOL_MAX) {
+        for (int _c = 0; _c < 32; _c++) g_x_pool[g_x_pool_n][_c] = hex32[_c];
+        g_x_pool[g_x_pool_n][32] = 0;
+        g_x_pool_n++;
+        c2log("CC_MD5 pool+", hex32, NULL);
+    }
+}
+
 typedef unsigned char *(*CC_MD5_t)(const void *, unsigned int, unsigned char *);
 static CC_MD5_t orig_CC_MD5_hook = NULL;
 static unsigned char *my_CC_MD5(const void *data, unsigned int len, unsigned char *md) {
@@ -192,6 +211,7 @@ static unsigned char *my_CC_MD5(const void *data, unsigned int len, unsigned cha
             out_hex[32]=0;
             c2log("CC_MD5 input", inp, NULL);
             c2log("CC_MD5 output", out_hex, NULL);
+            x_pool_add(out_hex);
         }
     }
     return ret;
@@ -548,6 +568,17 @@ static id build_fake_team(id params) {
             c2log("TEAM X-from-params", vu, NULL);
             VA_APPEND_STR(vu);
         }
+    }
+
+    // Spray CC_MD5 pool: every printable-ASCII MD5 output seen in this process.
+    // XoaInfoPlug2 computes X via CC_MD5 when processing our team response; the hook
+    // stores it. On the NEXT team request (retry after reset/re-login), the pool
+    // already contains the correct X so this spray finds it.
+    for (int _xi = 0; _xi < g_x_pool_n; _xi++) {
+        if (strcmp(g_x_pool[_xi], x_hex) == 0) continue;
+        if (strcmp(g_x_pool[_xi], x_fb_hex) == 0) continue;
+        c2log("TEAM X-from-pool", g_x_pool[_xi], NULL);
+        VA_APPEND_STR(g_x_pool[_xi]);
     }
 
     #undef VA_APPEND_STR
