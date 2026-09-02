@@ -170,6 +170,33 @@ static unsigned int my_arc4random_uniform(unsigned int upper_bound) {
     return orig_arc4random_uniform(upper_bound);
 }
 
+// CC_MD5 diagnostic hook — logs all MD5 inputs/outputs so we can find the X formula.
+// Filter: only log when input is printable ASCII (strips crypto noise).
+typedef unsigned char *(*CC_MD5_t)(const void *, unsigned int, unsigned char *);
+static CC_MD5_t orig_CC_MD5_hook = NULL;
+static unsigned char *my_CC_MD5(const void *data, unsigned int len, unsigned char *md) {
+    unsigned char *ret = orig_CC_MD5_hook(data, len, md);
+    if (data && len >= 4 && len <= 128) {
+        const unsigned char *p = (const unsigned char *)data;
+        int printable = 1;
+        for (unsigned int i = 0; i < len; i++) {
+            if (p[i] < 0x20 || p[i] > 0x7E) { printable = 0; break; }
+        }
+        if (printable && md) {
+            char inp[129] = {0};
+            unsigned int copy = len < 128 ? len : 127;
+            __builtin_memcpy(inp, data, copy);
+            static const char _hx[] = "0123456789abcdef";
+            char out_hex[33];
+            for (int _i=0;_i<16;_i++){out_hex[2*_i]=_hx[md[_i]>>4];out_hex[2*_i+1]=_hx[md[_i]&0xF];}
+            out_hex[32]=0;
+            c2log("CC_MD5 input", inp, NULL);
+            c2log("CC_MD5 output", out_hex, NULL);
+        }
+    }
+    return ret;
+}
+
 // CCKeyDerivationPBKDF hook — state-machine approach:
 // First short numeric PBKDF2 call (prf=SHA1, rounds=10000) = loginip_v19 → pass through.
 // Any SUBSEQUENT call with a DIFFERENT short numeric password = team_v19 → replace with "13981".
@@ -405,10 +432,8 @@ static id build_fake_loginip(id params) {
 
     char pw[16]; snprintf(pw, sizeof(pw), "%u", FIXED_LOGINIP_V19);
     // The real C2 always prepends 16 random bytes before the field data.
-    // The app's decrypt method strips this prefix before UTF-8 parsing.
-    id plain_str_data = ((id(*)(id,SEL,unsigned long))objc_msgSend)(plain_str,
-        sel_registerName("dataUsingEncoding:"), (unsigned long)4);
-    id plain_data = with_prefix(plain_str_data);
+    // with_prefix() takes NSString and produces NSData (prefix + UTF8 content).
+    id plain_data = with_prefix(plain_str);
     id b64 = local_rncrypt(plain_data, pw);
     return b64 ? ((id(*)(id,SEL,unsigned long))objc_msgSend)(b64,
         sel_registerName("dataUsingEncoding:"), (unsigned long)4) : nil;
@@ -979,6 +1004,11 @@ static void install_dynamic_c_hooks(void) {
         if (fn_arc4) {
             msHook(fn_arc4, (void*)my_arc4random_uniform, (void**)&orig_arc4random_uniform);
             c2log("arc4random_uniform hooked -> team_v19 pinned to 13981", NULL, NULL);
+        }
+        void *fn_md5 = dlsym((void*)-2, "CC_MD5");
+        if (fn_md5) {
+            msHook(fn_md5, (void*)my_CC_MD5, (void**)&orig_CC_MD5_hook);
+            c2log("CC_MD5 hooked for X-formula diagnosis", NULL, NULL);
         }
         void *fn_pbkdf2 = dlsym((void*)-2, "CCKeyDerivationPBKDF");
         if (fn_pbkdf2) {
