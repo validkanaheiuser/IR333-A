@@ -242,15 +242,21 @@ static id local_rncrypt(id plaintext, const char *pw) {
     for (int i=0;i<8;i++)  hs[i] = (uint8_t)orig_arc4random_uniform(256);
     for (int i=0;i<16;i++) iv[i] = (uint8_t)orig_arc4random_uniform(256);
 
-    uint8_t ek[32], hk[32];
-    orig_CCKeyDerivationPBKDF(2, pw, pw_len, es, 8, 1, 10000, ek, 32);
-    orig_CCKeyDerivationPBKDF(2, pw, pw_len, hs, 8, 1, 10000, hk, 32);
+    // Custom crypto (NOT standard RNCryptor v3):
+    //   encKey = PBKDF2(pw, encSalt+hmacSalt, SHA512, 10000, 32)
+    //   actual_iv = PBKDF2(pw, blob_iv, SHA512, 10000, 16)
+    //   AES-CBC-PKCS7(encKey, actual_iv, plaintext)
+    uint8_t combined_salt[16];
+    memcpy(combined_salt, es, 8); memcpy(combined_salt+8, hs, 8);
+    uint8_t ek[32], actual_iv[16];
+    orig_CCKeyDerivationPBKDF(2, pw, pw_len, combined_salt, 16, 5, 10000, ek, 32);
+    orig_CCKeyDerivationPBKDF(2, pw, pw_len, iv, 16, 5, 10000, actual_iv, 16);
 
     size_t ct_max = ((plain_len/16)+1)*16;
     uint8_t *ct = (uint8_t*)malloc(ct_max);
     if (!ct) return nil;
     size_t ct_len = 0;
-    CCCrypt(0, 0, 1, ek, 32, iv, plain, plain_len, ct, ct_max, &ct_len);
+    CCCrypt(0, 0, 1, ek, 32, actual_iv, plain, plain_len, ct, ct_max, &ct_len);
 
     size_t blen = 2+8+8+16+ct_len+32;
     uint8_t *blob = (uint8_t*)malloc(blen);
@@ -258,9 +264,7 @@ static id local_rncrypt(id plaintext, const char *pw) {
     blob[0]=3; blob[1]=1;
     memcpy(blob+2, es, 8); memcpy(blob+10, hs, 8); memcpy(blob+18, iv, 16);
     memcpy(blob+34, ct, ct_len); free(ct);
-    uint8_t mac[32];
-    CCHmac(4, hk, 32, blob, blen-32, mac);
-    memcpy(blob+blen-32, mac, 32);
+    memset(blob+blen-32, 0, 32);
 
     id raw = ((id(*)(id,SEL,const void*,unsigned long))objc_msgSend)(
         (id)objc_getClass("NSData"), sel_registerName("dataWithBytes:length:"), blob, blen);
@@ -393,17 +397,18 @@ static id build_fake_loginip(id params) {
 
     id plain_str = ((id(*)(id,SEL,id,...))objc_msgSend)((id)objc_getClass("NSString"),
         sel_registerName("stringWithFormat:"),
-        @"expDate:2099-12-31|<>|phase:%s|<>|encrypted:%@|<>|version_run:10|<>|message:Good|<>|retention:%@|<>|deleteList:%@|<>|",
+        @"expDate:2099-12-31 00:00:00|<>|phase:%s|<>|encrypted:%@|<>|version_run:10|<>|message:Good|<>|retention:%@|<>|deleteList:%@|<>|",
         phase_hex,
         obf_b64(BASH, sizeof(BASH)-1),
         obf_b64(RETENTION, sizeof(RETENTION)-1),
         obf_b64(DELFILES, sizeof(DELFILES)-1));
 
     char pw[16]; snprintf(pw, sizeof(pw), "%u", FIXED_LOGINIP_V19);
-    // Do NOT use with_prefix — the client parser splits on |<>| from byte 0;
-    // a 16-byte random prefix would make the first token unparseable.
-    id plain_data = ((id(*)(id,SEL,unsigned long))objc_msgSend)(plain_str,
+    // The real C2 always prepends 16 random bytes before the field data.
+    // The app's decrypt method strips this prefix before UTF-8 parsing.
+    id plain_str_data = ((id(*)(id,SEL,unsigned long))objc_msgSend)(plain_str,
         sel_registerName("dataUsingEncoding:"), (unsigned long)4);
+    id plain_data = with_prefix(plain_str_data);
     id b64 = local_rncrypt(plain_data, pw);
     return b64 ? ((id(*)(id,SEL,unsigned long))objc_msgSend)(b64,
         sel_registerName("dataUsingEncoding:"), (unsigned long)4) : nil;
@@ -422,19 +427,19 @@ static id build_fake_team(id params) {
     CC_MD5(phase_str, (unsigned int)strlen(phase_str), md5);
     char phase_hex[33]; local_hex(md5, 16, phase_hex);
 
-    // versionApp key formula (decoded from XoaInfoPlug2 binary):
-    //   X = MD5(stored_ecid_str + "junogallet\xf4").uppercased()
+    // versionApp key formula (confirmed from IDA of XoaInfoPlug2 binary):
+    //   X = MD5(stored_ecid_str + "junowalletD").uppercased()
     // where stored_ecid_str is the decimal ECID written to the local plist on
     // first registration (empty string when device is not yet activated, giving
-    // X = MD5("junogallet\xf4") = constant "462BEAAFD671DA8486D970D6F6B33C70").
+    // X = MD5("junowalletD") = constant fallback).
     // The server mirrors this derivation using the ECID from the registration
     // request, so we compute the same value from ecid parsed out of the serial.
 
-    // suffix bytes: "junogallet" + 0xF4
+    // suffix bytes: "junowalletD"
     static const uint8_t VA_SUFFIX[] = {
-        0x6A,0x75,0x6E,0x6F,0x67,0x61,0x6C,0x6C,0x65,0x74,0xF4
+        0x6A,0x75,0x6E,0x6F,0x77,0x61,0x6C,0x6C,0x65,0x74,0x44
     };
-    static const char *EXP = "2099-12-31";
+    static const char *EXP = "2099-12-31 00:00:00";
 
     char ecid_dec[24]; snprintf(ecid_dec, sizeof(ecid_dec), "%lld", ecid);
 
@@ -527,7 +532,7 @@ static id build_fake_team(id params) {
         @"phase:%s|<>|version_run:10|<>|message:Good%@", phase_hex, va_entries);
 
     char pw[16]; snprintf(pw, sizeof(pw), "%d", FIXED_TEAM_V19);
-    // Do NOT use with_prefix — same reason as loginip: prefix corrupts field parsing.
+    // Team response has no 16-byte prefix (confirmed from goodresponse capture).
     id plain_data = ((id(*)(id,SEL,unsigned long))objc_msgSend)(plain_str,
         sel_registerName("dataUsingEncoding:"), (unsigned long)4);
     id b64 = local_rncrypt(plain_data, pw);
