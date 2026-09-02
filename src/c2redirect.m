@@ -920,15 +920,38 @@ static id hook_sess_dataTaskWithRequestCompletion(id self, SEL _cmd, id req, id 
     const char *host_c = host_ns ? ((const char*(*)(id,SEL))objc_msgSend)(host_ns, sel_registerName("UTF8String")) : NULL;
     const char *path_c = path_ns ? ((const char*(*)(id,SEL))objc_msgSend)(path_ns, sel_registerName("UTF8String")) : NULL;
 
-    if (host_c && is_c2_target(host_c) && path_c && block) {
+    // Accept BOTH the original C2 host AND the redirect host (xf.meomeo.social).
+    // The NSURL/NSURLRequest hooks run before this hook and rewrite the host to
+    // REDIRECT_HOST first, so by the time we see the request, host_c is already
+    // REDIRECT_HOST — which is excluded by is_c2_target to prevent redirect loops.
+    // Checking for REDIRECT_HOST here catches that pre-redirected case.
+    int is_auth_host = host_c && (is_c2_target(host_c) || strcmp(host_c, REDIRECT_HOST) == 0);
+
+    if (is_auth_host && path_c && block) {
         id params = req_params(req);
         id fake = nil;
         if (strstr(path_c, "loginip")) {
             fake = build_fake_loginip(params ?: @"");
-            c2log("FAKE-AUTH inject loginip (no mock server)", NULL, NULL);
+            if (fake) {
+                c2log("FAKE-AUTH inject loginip", NULL, NULL);
+            } else {
+                c2log("FAKE-AUTH loginip build FAILED (orig_CCKeyDerivationPBKDF NULL?)", NULL, NULL);
+            }
         } else if (strstr(path_c, "team")) {
             fake = build_fake_team(params ?: @"");
-            c2log("FAKE-AUTH inject team (no mock server)", NULL, NULL);
+            if (fake) {
+                c2log("FAKE-AUTH inject team", NULL, NULL);
+            } else {
+                c2log("FAKE-AUTH team build FAILED (orig_CCKeyDerivationPBKDF NULL?)", NULL, NULL);
+            }
+        } else {
+            // Catch-all: return 200 OK for any other C2 path to prevent indefinite
+            // hangs on unknown endpoints (reset data, version check, etc.).
+            static const char ok_body[] = "ok";
+            fake = ((id(*)(id,SEL,const void*,unsigned long))objc_msgSend)(
+                (id)objc_getClass("NSData"), sel_registerName("dataWithBytes:length:"),
+                ok_body, 2UL);
+            c2log("FAKE-AUTH catch-all 200 OK for", path_c, NULL);
         }
         if (fake) {
             return inject_fake_and_cancel(self, req, fake, block,
@@ -945,7 +968,8 @@ static id hook_conn_sendSync(id self, SEL _cmd, id req, void *resp, void *err) {
     const char *host_c = host_ns ? ((const char*(*)(id,SEL))objc_msgSend)(host_ns, sel_registerName("UTF8String")) : NULL;
     const char *path_c = path_ns ? ((const char*(*)(id,SEL))objc_msgSend)(path_ns, sel_registerName("UTF8String")) : NULL;
 
-    if (host_c && is_c2_target(host_c) && path_c) {
+    int is_auth_host = host_c && (is_c2_target(host_c) || strcmp(host_c, REDIRECT_HOST) == 0);
+    if (is_auth_host && path_c) {
         id params = req_params(req);
         id fake = nil;
         if (strstr(path_c, "loginip")) {
