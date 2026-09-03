@@ -636,7 +636,16 @@ static id build_fake_team(id params) {
 
     char ecid_dec[24]; snprintf(ecid_dec, sizeof(ecid_dec), "%lld", ecid);
 
-    // Primary: MD5(ecid_decimal + suffix) — device-specific X
+    // Known (ecid → X) pairs captured from real server responses.
+    // X formula is unknown (not MD5 of any simple device-field combination),
+    // so we hard-code confirmed values here.  Any new device's X is captured
+    // by the CC_MD5 pool hook on the first login attempt and auto-added on retry.
+    static const struct { long long ecid; const char *x; } KNOWN_X[] = {
+        { 5393981226811438LL, "58716DC8BAD43E293B8D2D0F4F53B609" },
+    };
+    static const unsigned int KNOWN_X_N = (unsigned int)(sizeof(KNOWN_X)/sizeof(KNOWN_X[0]));
+
+    // Primary: MD5(ecid_decimal + suffix) — formula is unconfirmed, kept as best-effort
     uint8_t x_md5[16]; char x_hex[33];
     {
         uint8_t inp[sizeof(ecid_dec) + sizeof(VA_SUFFIX)];
@@ -672,7 +681,16 @@ static id build_fake_team(id params) {
         ((void(*)(id,SEL,id,...))objc_msgSend)(va_entries, sel_registerName("appendFormat:"), \
             @"|<>|versionApp%s.expDate:%s", (s), EXP)
 
-    VA_APPEND_STR(x_hex);    // primary: ecid-derived X
+    // Known-X lookup: if this device's ECID is in the table, prepend the confirmed X first.
+    for (unsigned int _ki = 0; _ki < KNOWN_X_N; _ki++) {
+        if (KNOWN_X[_ki].ecid == ecid) {
+            c2log("TEAM X-known", KNOWN_X[_ki].x, NULL);
+            VA_APPEND_STR(KNOWN_X[_ki].x);
+            break;
+        }
+    }
+
+    VA_APPEND_STR(x_hex);    // primary formula (best-effort)
     if (strcmp(x_hex, x_fb_hex) != 0)
         VA_APPEND_STR(x_fb_hex); // fallback: constant X (unactivated path)
 
