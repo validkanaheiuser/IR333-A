@@ -155,6 +155,12 @@ static SecTrustEvaluate_t orig_SecTrustEvaluate = NULL;
 #define FIXED_ARC4_RET    (FIXED_TEAM_V19 - 8215)   /* 5766 */
 #define FIXED_LOGINIP_V19 88381u   /* pins arc4random_uniform(14178236) */
 
+// X pool — shared by CC_MD5 hook (populate) and my_CCCrypt (consume).
+// Declared here so arc4random hook can reset it before CC_MD5 runs.
+#define X_POOL_MAX 64
+static char g_x_pool[X_POOL_MAX][33];
+static int  g_x_pool_n = 0;
+
 typedef unsigned int (*arc4random_uniform_t)(unsigned int);
 static arc4random_uniform_t orig_arc4random_uniform = NULL;
 
@@ -175,14 +181,10 @@ static unsigned int my_arc4random_uniform(unsigned int upper_bound) {
 }
 
 // CC_MD5 hook — two jobs:
-//   1. Log every call with printable-ASCII input for diagnosis.
-//   2. Pool all MD5 outputs. build_fake_team() sprays the pool as versionApp{X}.expDate
-//      candidates so XoaInfoPlug2 always finds the right X — even though X is computed
-//      AFTER the response is sent (timing solved by capture-on-first-run, use-on-retry).
-#define X_POOL_MAX 64
-static char g_x_pool[X_POOL_MAX][33];  // each entry: 32 lowercase hex + NUL
-static int  g_x_pool_n = 0;
-
+//   1. Capture every call with printable-ASCII input for diagnosis.
+//   2. Pool all MD5 outputs. my_CCCrypt sprays the pool as versionApp{X}.expDate
+//      candidates so XoaInfoPlug2 always finds the right X.
+//   Pool declared above (before arc4random hook) so arc4 hook can reset it.
 static void x_pool_add(const char *hex32) {
     for (int _p = 0; _p < g_x_pool_n; _p++)
         if (strcmp(g_x_pool[_p], hex32) == 0) return;
