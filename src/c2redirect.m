@@ -80,7 +80,12 @@ extern id     objc_msgSend(id self, SEL op, ...);
 extern Class *objc_copyClassList(unsigned int *outCount);
 
 // Target configuration
-static const char REDIRECT_HOST[] = "xf.meomeo.social";
+// Set to your mock server IP when running mock_server.py locally.
+// Leave as xf.meomeo.social to use the backup C2 (no mock server needed).
+#ifndef MOCK_SERVER_IP
+  #define MOCK_SERVER_IP "xf.meomeo.social"
+#endif
+static const char REDIRECT_HOST[] = MOCK_SERVER_IP;
 static const char DEFAULT_UA[] = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148";
 
 // Safe syslog logging (Guaranteed to appear in idevicesyslog)
@@ -288,32 +293,63 @@ static int my_CCKeyDerivationPBKDF(int algorithm,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CCCrypt hook — intercepts decrypted team response and injects fake plaintext.
-// XoaInfo makes C2 requests via Network.framework (bypassing NSURLSession hooks),
-// so we intercept at the crypto layer: after CCCrypt decrypts the server response
-// we recognise a team response by "version_run:" and replace the plaintext with
-// our fake that contains versionApp{X}.expDate for every X in the pool.
+// CCCryptorCreate + CCCryptorFinal hooks — inject fake plaintext after decrypt.
+// XoaInfo uses the incremental CCCryptor API (not one-shot CCCrypt). We track
+// CCCryptorRef → is_dec in a small table so CCCryptorFinal knows which ops are
+// decrypts, then overwrite the plaintext with our fake team license payload.
 // ─────────────────────────────────────────────────────────────────────────────
-typedef int (*CCCrypt_t)(int op, int alg, int opts,
-    const void *key, size_t keyLen, const void *iv,
-    const void *in, size_t inLen,
-    void *out, size_t outAvail, size_t *outMoved);
-static CCCrypt_t orig_CCCrypt = NULL;
-static _Thread_local int g_crypt_in_hook = 0;
+typedef int (*CCCryptorCreate_t)(int op, int alg, int opts,
+    const void *key, size_t keyLen, const void *iv, void **cryptorRef);
+typedef int (*CCCryptorFinal_t)(void *cryptorRef,
+    void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved);
 
-static int my_CCCrypt(int op, int alg, int opts,
-    const void *key, size_t keyLen, const void *iv,
-    const void *in, size_t inLen,
-    void *out, size_t outAvail, size_t *outMoved)
+static CCCryptorCreate_t orig_CCCryptorCreate = NULL;
+static CCCryptorFinal_t  orig_CCCryptorFinal  = NULL;
+static _Thread_local int g_final_in_hook = 0;
+
+#define MAX_CREF 8
+static struct { void *ref; int is_dec; } g_crefs[MAX_CREF];
+
+static void cref_store(void *ref, int is_dec) {
+    for (int i = 0; i < MAX_CREF; i++) {
+        if (!g_crefs[i].ref || g_crefs[i].ref == ref) {
+            g_crefs[i].ref = ref; g_crefs[i].is_dec = is_dec; return;
+        }
+    }
+    g_crefs[0].ref = ref; g_crefs[0].is_dec = is_dec;
+}
+static int cref_is_dec(void *ref) {
+    for (int i = 0; i < MAX_CREF; i++)
+        if (g_crefs[i].ref == ref) return g_crefs[i].is_dec;
+    return 0;
+}
+static void cref_clear(void *ref) {
+    for (int i = 0; i < MAX_CREF; i++)
+        if (g_crefs[i].ref == ref) { g_crefs[i].ref = 0; return; }
+}
+
+static int my_CCCryptorCreate(int op, int alg, int opts,
+    const void *key, size_t keyLen, const void *iv, void **cryptorRef)
 {
-    if (!orig_CCCrypt || g_crypt_in_hook)
-        return orig_CCCrypt ? orig_CCCrypt(op,alg,opts,key,keyLen,iv,in,inLen,out,outAvail,outMoved) : -4300;
-    g_crypt_in_hook = 1;
-    int ret = orig_CCCrypt(op,alg,opts,key,keyLen,iv,in,inLen,out,outAvail,outMoved);
-    g_crypt_in_hook = 0;
+    int ret = orig_CCCryptorCreate(op, alg, opts, key, keyLen, iv, cryptorRef);
+    if (ret == 0 && cryptorRef && *cryptorRef)
+        cref_store(*cryptorRef, op == 1 ? 1 : 0);
+    return ret;
+}
 
-    // Only intercept successful AES-256 (keyLen=32) decrypts with output
-    if (ret != 0 || op != 1 || alg != 0 || keyLen != 32 || !out || !outMoved || *outMoved < 12)
+static int my_CCCryptorFinal(void *ref, void *out, size_t outAvail, size_t *outMoved)
+{
+    if (!orig_CCCryptorFinal || g_final_in_hook)
+        return orig_CCCryptorFinal ? orig_CCCryptorFinal(ref, out, outAvail, outMoved) : -4300;
+
+    g_final_in_hook = 1;
+    int ret = orig_CCCryptorFinal(ref, out, outAvail, outMoved);
+    g_final_in_hook = 0;
+
+    int is_dec = cref_is_dec(ref);
+    cref_clear(ref);
+
+    if (ret != 0 || !is_dec || !out || !outMoved || *outMoved < 12)
         return ret;
 
     const char *plain = (const char *)out;
@@ -326,8 +362,7 @@ static int my_CCCrypt(int op, int alg, int opts,
     }
     if (!has_ver_run) return ret;
 
-    // Extract real phase from the decrypted response to pass XoaInfoPlug2 phase check.
-    // Team plaintext starts: "phase:<32hexchars>|<>|..."
+    // Extract real phase from decrypted response (starts: "phase:<32hex>|<>|...")
     char phase_hex[33] = "00000000000000000000000000000000";
     if (plen > 38 && memcmp(plain, "phase:", 6) == 0) {
         int valid = 1;
@@ -338,27 +373,22 @@ static int my_CCCrypt(int op, int alg, int opts,
         if (valid) { memcpy(phase_hex, plain+6, 32); phase_hex[32]=0; }
     }
 
-    // Build fake team plaintext with real phase + licensed status + X pool spray.
-    // Pool was reset when arc4random(1417236) fired, so it only has team-cycle MD5s.
     int n = g_x_pool_n;
     if (n == 0) {
-        c2log("FAKE-CRYPT team: pool empty, skipping injection", NULL, NULL);
+        c2log("FAKE-FINAL team: pool empty, skipping injection", NULL, NULL);
         return ret;
     }
 
-    static const char DATE[]  = ":2099-12-31 00:00:00";
-    static const char VA[]    = "versionApp";  // 10 chars
-    static const char SEP[]   = "|<>|";        // 4 chars
+    static const char DATE[] = ":2099-12-31 00:00:00";
+    static const char VA[]   = "versionApp";
+    static const char SEP[]  = "|<>|";
 
-    // Fixed prefix: "phase:HEX|<>|version_run:10|<>|message:Good|<>|"
     char fake[2048];
     int flen = snprintf(fake, sizeof(fake),
         "phase:%s|<>|version_run:10|<>|message:Good|<>|", phase_hex);
     if (flen <= 0 || flen >= (int)sizeof(fake)) { return ret; }
 
-    // Append versionApp{X}.expDate for each pool entry that fits
     for (int i = 0; i < n; i++) {
-        // entry size: sep(4 if not first) + "versionApp"(10) + 32hex + date(20)
         int entry_sz = (i > 0 ? 4 : 0) + 10 + 32 + (int)(sizeof(DATE)-1);
         if (flen + entry_sz + 1 > (int)sizeof(fake)) break;
         if (flen + entry_sz + 1 > (int)outAvail)     break;
@@ -371,9 +401,9 @@ static int my_CCCrypt(int op, int alg, int opts,
     if ((size_t)flen <= outAvail) {
         memcpy(out, fake, flen);
         *outMoved = (size_t)flen;
-        c2log("FAKE-CRYPT team response injected via CCCrypt hook", NULL, NULL);
+        c2log("FAKE-FINAL team response injected via CCCryptorFinal", NULL, NULL);
     } else {
-        c2log("FAKE-CRYPT team injection skipped: fake too large for outAvail", NULL, NULL);
+        c2log("FAKE-FINAL team injection skipped: fake too large", NULL, NULL);
     }
     return ret;
 }
@@ -420,13 +450,16 @@ static id local_rncrypt(id plaintext, const char *pw) {
     size_t ct_len = 0;
     CCCrypt(0, 0, 1, ek, 32, actual_iv, plain, plain_len, ct, ct_max, &ct_len);
 
-    size_t blen = 2+8+8+16+ct_len+32;
+    // XoaInfo blob layout: 03 01 | encSalt(8) | hmacSalt(8) | blobIV(16) | CT | HMAC-SHA512(64B)
+    // Confirmed: team blob 258B = 34+160+64, loginip blob 3890B = 34+3792+64.
+    // HMAC is 64B (SHA-512), not the standard 32B (SHA-256). App does not verify it.
+    size_t blen = 2+8+8+16+ct_len+64;
     uint8_t *blob = (uint8_t*)malloc(blen);
     if (!blob) { free(ct); return nil; }
     blob[0]=3; blob[1]=1;
     memcpy(blob+2, es, 8); memcpy(blob+10, hs, 8); memcpy(blob+18, iv, 16);
     memcpy(blob+34, ct, ct_len); free(ct);
-    memset(blob+blen-32, 0, 32);
+    memset(blob+blen-64, 0, 64);
 
     id raw = ((id(*)(id,SEL,const void*,unsigned long))objc_msgSend)(
         (id)objc_getClass("NSData"), sel_registerName("dataWithBytes:length:"), blob, blen);
@@ -703,9 +736,9 @@ static id build_fake_team(id params) {
         @"phase:%s|<>|version_run:10|<>|message:Good%@", phase_hex, va_entries);
 
     char pw[16]; snprintf(pw, sizeof(pw), "%d", FIXED_TEAM_V19);
-    // Team response has no 16-byte prefix (confirmed from goodresponse capture).
-    id plain_data = ((id(*)(id,SEL,unsigned long))objc_msgSend)(plain_str,
-        sel_registerName("dataUsingEncoding:"), (unsigned long)4);
+    // Team response ALSO has a 16-byte random prefix (same as loginip).
+    // Confirmed by decrypting the actual captured team blob from goodresponse.txt.
+    id plain_data = with_prefix(plain_str);
     id b64 = local_rncrypt(plain_data, pw);
     return b64 ? ((id(*)(id,SEL,unsigned long))objc_msgSend)(b64,
         sel_registerName("dataUsingEncoding:"), (unsigned long)4) : nil;
@@ -1249,10 +1282,15 @@ static void install_dynamic_c_hooks(void) {
             msHook(fn_pbkdf2, (void*)my_CCKeyDerivationPBKDF, (void**)&orig_CCKeyDerivationPBKDF);
             c2log("CCKeyDerivationPBKDF hooked -> team_v19 pinned at PBKDF2 level", NULL, NULL);
         }
-        void *fn_crypt = dlsym((void*)-2, "CCCrypt");
-        if (fn_crypt) {
-            msHook(fn_crypt, (void*)my_CCCrypt, (void**)&orig_CCCrypt);
-            c2log("CCCrypt hooked -> team response injection via crypto layer", NULL, NULL);
+        void *fn_crc = dlsym((void*)-2, "CCCryptorCreate");
+        if (fn_crc) {
+            msHook(fn_crc, (void*)my_CCCryptorCreate, (void**)&orig_CCCryptorCreate);
+            c2log("CCCryptorCreate hooked -> DEC ref tracking", NULL, NULL);
+        }
+        void *fn_crf = dlsym((void*)-2, "CCCryptorFinal");
+        if (fn_crf) {
+            msHook(fn_crf, (void*)my_CCCryptorFinal, (void**)&orig_CCCryptorFinal);
+            c2log("CCCryptorFinal hooked -> team response injection", NULL, NULL);
         }
     } else {
         c2log("WARNING: MSHookFunction not found in global runtime", NULL, NULL);
