@@ -900,14 +900,73 @@ static void hook_mreq_setURL(id self, SEL _cmd, id url) {
 }
 
 static id hook_sess_dataTaskWithURL(id self, SEL _cmd, id url) {
+    if (url) {
+        id host_ns = ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("host"));
+        const char *host_c = host_ns ? ((const char*(*)(id,SEL))objc_msgSend)(host_ns, sel_registerName("UTF8String")) : NULL;
+        if (host_c && (is_c2_target(host_c) || strcmp(host_c, REDIRECT_HOST) == 0)) {
+            id path_ns = ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("path"));
+            const char *path_c = path_ns ? ((const char*(*)(id,SEL))objc_msgSend)(path_ns, sel_registerName("UTF8String")) : NULL;
+            c2log("DEBUG dataTaskWithURL (no block)", host_c, path_c ? path_c : "(nil)");
+        }
+    }
     return orig_sess_dataTaskWithURL(self, _cmd, redirectURL(url));
 }
 
+// Full injection logic for dataTaskWithURL:completionHandler: — same as the
+// request-based hook but receives an NSURL directly (no HTTPBody).
+// XoaInfo may use this variant instead of dataTaskWithRequest:completionHandler:.
 static id hook_sess_dataTaskWithURLCompletion(id self, SEL _cmd, id url, id block) {
+    if (url) {
+        id host_ns = ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("host"));
+        id path_ns = ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("path"));
+        const char *host_c = host_ns ? ((const char*(*)(id,SEL))objc_msgSend)(host_ns, sel_registerName("UTF8String")) : NULL;
+        const char *path_c = path_ns ? ((const char*(*)(id,SEL))objc_msgSend)(path_ns, sel_registerName("UTF8String")) : NULL;
+        int is_auth_host = host_c && (is_c2_target(host_c) || strcmp(host_c, REDIRECT_HOST) == 0);
+        if (is_auth_host) {
+            c2log("DEBUG dataTaskWithURL:completion", host_c, path_c ? path_c : "(nil)");
+            if (!block) c2log("DEBUG dataTaskWithURL:completion block=NIL", host_c, NULL);
+        }
+        if (is_auth_host && path_c && block) {
+            id query_ns = ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("query"));
+            id params = query_ns ?: @"";
+            id fake = nil;
+            if (strstr(path_c, "loginip")) {
+                fake = build_fake_loginip(params);
+                c2log(fake ? "FAKE-AUTH-URL inject loginip" : "FAKE-AUTH-URL loginip build FAILED", NULL, NULL);
+            } else if (strstr(path_c, "team")) {
+                fake = build_fake_team(params);
+                c2log(fake ? "FAKE-AUTH-URL inject team" : "FAKE-AUTH-URL team build FAILED", NULL, NULL);
+            } else {
+                static const char ok_body_u[] = "ok";
+                fake = ((id(*)(id,SEL,const void*,unsigned long))objc_msgSend)(
+                    (id)objc_getClass("NSData"), sel_registerName("dataWithBytes:length:"),
+                    ok_body_u, 2UL);
+                c2log("FAKE-AUTH-URL catch-all 200 OK for", path_c, NULL);
+            }
+            if (fake) {
+                // inject_fake_and_cancel needs an NSURLRequest; wrap the NSURL.
+                id temp_req = ((id(*)(id,SEL,id))objc_msgSend)(
+                    (id)objc_getClass("NSURLRequest"),
+                    sel_registerName("requestWithURL:"), url);
+                return inject_fake_and_cancel(self, temp_req, fake, block,
+                    orig_sess_dataTaskWithRequestCompletion);
+            }
+        }
+    }
     return orig_sess_dataTaskWithURLCompletion(self, _cmd, redirectURL(url), block);
 }
 
 static id hook_sess_dataTaskWithRequest(id self, SEL _cmd, id req) {
+    id url = ((id(*)(id,SEL))objc_msgSend)(req, sel_registerName("URL"));
+    if (url) {
+        id host_ns = ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("host"));
+        const char *host_c = host_ns ? ((const char*(*)(id,SEL))objc_msgSend)(host_ns, sel_registerName("UTF8String")) : NULL;
+        if (host_c && (is_c2_target(host_c) || strcmp(host_c, REDIRECT_HOST) == 0)) {
+            id path_ns = ((id(*)(id,SEL))objc_msgSend)(url, sel_registerName("path"));
+            const char *path_c = path_ns ? ((const char*(*)(id,SEL))objc_msgSend)(path_ns, sel_registerName("UTF8String")) : NULL;
+            c2log("DEBUG dataTaskWithRequest (no block)", host_c, path_c ? path_c : "(nil)");
+        }
+    }
     return orig_sess_dataTaskWithRequest(self, _cmd, redirectRequestObj(req));
 }
 
@@ -937,6 +996,11 @@ static id hook_sess_dataTaskWithRequestCompletion(id self, SEL _cmd, id req, id 
     // REDIRECT_HOST — which is excluded by is_c2_target to prevent redirect loops.
     // Checking for REDIRECT_HOST here catches that pre-redirected case.
     int is_auth_host = host_c && (is_c2_target(host_c) || strcmp(host_c, REDIRECT_HOST) == 0);
+
+    if (is_auth_host) {
+        c2log("DEBUG dataTaskWithReq:completion", host_c, path_c ? path_c : "(nil)");
+        if (!block) c2log("DEBUG dataTaskWithReq:completion block=NIL", host_c, NULL);
+    }
 
     if (is_auth_host && path_c && block) {
         id params = req_params(req);
