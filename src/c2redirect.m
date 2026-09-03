@@ -22,6 +22,7 @@ typedef int           int32_t;
 typedef long          intptr_t;
 typedef unsigned long uintptr_t;
 typedef long          dispatch_once_t;
+typedef long long     dispatch_time_t;
 typedef signed char   BOOL;
 #define YES ((BOOL)1)
 #define NO  ((BOOL)0)
@@ -60,6 +61,8 @@ extern unsigned char *CC_SHA1(const void *data, unsigned int len, unsigned char 
 typedef void *dispatch_queue_t;
 extern dispatch_queue_t dispatch_get_global_queue(long identifier, unsigned long flags);
 extern void             dispatch_async(dispatch_queue_t queue, void (^block)(void));
+extern dispatch_time_t  dispatch_time(dispatch_time_t when, long long delta);
+extern void             dispatch_after(dispatch_time_t when, dispatch_queue_t queue, void (^block)(void));
 
 // ObjC runtime types & functions
 typedef struct objc_class  *Class;
@@ -214,32 +217,26 @@ static unsigned char *my_CC_MD5(const void *data, unsigned int len, unsigned cha
 
     unsigned char *ret = orig_CC_MD5_hook(data, len, md);
 
-    // Only capture: printable ASCII, 8–64 bytes (device-id range).
-    // No syslog here — logging happens later in build_fake_team.
+    // Capture all MD5s in the device-id length range (8–64 bytes).
+    // The X computation uses a raw obfuscated salt that contains non-ASCII bytes,
+    // so we cannot filter on printable ASCII — that would silently drop the real X.
+    // MobileGestalt lookups (MGCopyAnswer*) are still excluded to avoid pool noise.
     if (data && len >= 8 && len <= 64 && md) {
         const unsigned char *p = (const unsigned char *)data;
-        int printable = 1;
-        for (unsigned int i = 0; i < len; i++) {
-            if (p[i] < 0x20 || p[i] > 0x7E) { printable = 0; break; }
+        // Skip MobileGestalt property name lookups — MGCopyAnswerXxx strings
+        // would otherwise fill the pool with irrelevant hashes.
+        if (len >= 12 &&
+            p[0]=='M' && p[1]=='G' && p[2]=='C' && p[3]=='o' &&
+            p[4]=='p' && p[5]=='y' && p[6]=='A' && p[7]=='n' &&
+            p[8]=='s' && p[9]=='w' && p[10]=='e' && p[11]=='r') {
+            g_md5_in_hook = 0;
+            return ret;
         }
-        if (printable) {
-            // Skip MobileGestalt property name lookups — MGCopyAnswerXxx strings
-            // pollute the X-pool with garbage before the real X is computed.
-            // Confirmed from device logs: 15/16 pool slots were wasted on these
-            // before the correct X (MD5("ase1junowalletD")) got the last slot.
-            if (len >= 12 &&
-                p[0]=='M' && p[1]=='G' && p[2]=='C' && p[3]=='o' &&
-                p[4]=='p' && p[5]=='y' && p[6]=='A' && p[7]=='n' &&
-                p[8]=='s' && p[9]=='w' && p[10]=='e' && p[11]=='r') {
-                g_md5_in_hook = 0;
-                return ret;
-            }
-            static const char _hx[] = "0123456789abcdef";
-            char out_hex[33];
-            for (int _i=0;_i<16;_i++){out_hex[2*_i]=_hx[md[_i]>>4];out_hex[2*_i+1]=_hx[md[_i]&0xF];}
-            out_hex[32]=0;
-            x_pool_add(out_hex);
-        }
+        static const char _hx[] = "0123456789abcdef";
+        char out_hex[33];
+        for (int _i=0;_i<16;_i++){out_hex[2*_i]=_hx[md[_i]>>4];out_hex[2*_i+1]=_hx[md[_i]&0xF];}
+        out_hex[32]=0;
+        x_pool_add(out_hex);
     }
 
     g_md5_in_hook = 0;
@@ -620,17 +617,16 @@ static id build_fake_team(id params) {
     CC_MD5(phase_str, (unsigned int)strlen(phase_str), md5);
     char phase_hex[33]; local_hex(md5, 16, phase_hex);
 
-    // versionApp key formula (confirmed from IDA of XoaInfoPlug2 binary):
-    //   X = MD5(stored_ecid_str + "junowalletD").uppercased()
-    // where stored_ecid_str is the decimal ECID written to the local plist on
-    // first registration (empty string when device is not yet activated, giving
-    // X = MD5("junowalletD") = constant fallback).
-    // The server mirrors this derivation using the ECID from the registration
-    // request, so we compute the same value from ecid parsed out of the serial.
+    // versionApp key formula (IDA sub_1000EB3DC):
+    //   preimage = ivar_r3SFLWu0 (some device NSString) + raw_salt_11bytes
+    //   X = MD5(preimage).lowercase  [k4NsES3G returns lowercase hex]
+    // raw_salt_11bytes = 27 C6 1F 65 0E 16 0C FD 0B 40 A9 (obfuscated CFString,
+    // NOT "junowalletD"; ivar source unknown — pool spray handles this at runtime).
+    // VA_SUFFIX below is a best-effort placeholder; the CC_MD5 pool provides real X.
 
-    // suffix bytes: "junowalletD"
+    // suffix bytes (obfuscated, not "junowalletD" — kept for pool dedup only)
     static const uint8_t VA_SUFFIX[] = {
-        0x6A,0x75,0x6E,0x6F,0x77,0x61,0x6C,0x6C,0x65,0x74,0x44
+        0x27,0xC6,0x1F,0x65,0x0E,0x16,0x0C,0xFD,0x0B,0x40,0xA9
     };
     static const char *EXP = "2099-12-31 00:00:00";
 
@@ -641,7 +637,7 @@ static id build_fake_team(id params) {
     // so we hard-code confirmed values here.  Any new device's X is captured
     // by the CC_MD5 pool hook on the first login attempt and auto-added on retry.
     static const struct { long long ecid; const char *x; } KNOWN_X[] = {
-        { 5393981226811438LL, "58716DC8BAD43E293B8D2D0F4F53B609" },
+        { 5393981226811438LL, "58716dc8bad43e293b8d2d0f4f53b609" },
     };
     static const unsigned int KNOWN_X_N = (unsigned int)(sizeof(KNOWN_X)/sizeof(KNOWN_X[0]));
 
@@ -653,17 +649,13 @@ static id build_fake_team(id params) {
         memcpy(inp, ecid_dec, ecid_len);
         memcpy(inp + ecid_len, VA_SUFFIX, sizeof(VA_SUFFIX));
         CC_MD5(inp, ecid_len + (unsigned int)sizeof(VA_SUFFIX), x_md5);
-        local_hex(x_md5, 16, x_hex);
-        for (int _i = 0; x_hex[_i]; _i++)
-            if (x_hex[_i] >= 'a') x_hex[_i] &= ~0x20;
+        local_hex(x_md5, 16, x_hex);  // local_hex produces lowercase
     }
 
     // Fallback: MD5(suffix alone) — constant for unactivated devices
     uint8_t x_fb_md5[16]; char x_fb_hex[33];
     CC_MD5(VA_SUFFIX, (unsigned int)sizeof(VA_SUFFIX), x_fb_md5);
-    local_hex(x_fb_md5, 16, x_fb_hex);
-    for (int _i = 0; x_fb_hex[_i]; _i++)
-        if (x_fb_hex[_i] >= 'a') x_fb_hex[_i] &= ~0x20;
+    local_hex(x_fb_md5, 16, x_fb_hex);  // local_hex produces lowercase
 
     // Log what we have so far for diagnosis via: log stream --predicate 'eventMessage contains "C2Redirect"'
     const char *params_c = params
@@ -725,10 +717,10 @@ static id build_fake_team(id params) {
                 }
             }
             if (!all_hex) continue;
-            // Uppercase in-place
+            // Normalize to lowercase for consistent comparison with pool entries
             char vu[33];
             for (int _h = 0; _h < 32; _h++)
-                vu[_h] = (char)(vc[_h] >= 'a' ? (vc[_h] & ~0x20) : vc[_h]);
+                vu[_h] = (char)(vc[_h] >= 'A' && vc[_h] <= 'Z' ? (vc[_h] | 0x20) : vc[_h]);
             vu[32] = 0;
             if (strcmp(vu, x_hex) == 0 || strcmp(vu, x_fb_hex) == 0) continue; // already added
             c2log("TEAM X-from-params", vu, NULL);
@@ -785,7 +777,12 @@ static id inject_fake_and_cancel(id self_session, id original_req,
     __block id captured_body = body;
     __block id captured_block = orig_impl_block;
     __block id captured_url = url_obj;
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+    // 200 ms delay: X = MD5(ivar+salt) is computed in the TEAM request path
+    // concurrently with this network call (dispatched async just before the call).
+    // The delay gives CC_MD5 time to fire and populate g_x_pool before we build
+    // the fake response, ensuring first-attempt activation on any device.
+    dispatch_time_t _t = dispatch_time(0LL, 200LL * 1000000LL);
+    dispatch_after(_t, dispatch_get_global_queue(0, 0), ^{
         // Build a 200 OK NSHTTPURLResponse
         id resp = ((id(*)(id,SEL,id,long,id,id))objc_msgSend)(
             ((id(*)(id,SEL))objc_msgSend)((id)objc_getClass("NSHTTPURLResponse"), sel_registerName("alloc")),
