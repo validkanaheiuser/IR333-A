@@ -175,7 +175,7 @@ static unsigned int my_arc4random_uniform(unsigned int upper_bound) {
 //   2. Pool all MD5 outputs. build_fake_team() sprays the pool as versionApp{X}.expDate
 //      candidates so XoaInfoPlug2 always finds the right X — even though X is computed
 //      AFTER the response is sent (timing solved by capture-on-first-run, use-on-retry).
-#define X_POOL_MAX 16
+#define X_POOL_MAX 64
 static char g_x_pool[X_POOL_MAX][33];  // each entry: 32 lowercase hex + NUL
 static int  g_x_pool_n = 0;
 
@@ -212,6 +212,17 @@ static unsigned char *my_CC_MD5(const void *data, unsigned int len, unsigned cha
             if (p[i] < 0x20 || p[i] > 0x7E) { printable = 0; break; }
         }
         if (printable) {
+            // Skip MobileGestalt property name lookups — MGCopyAnswerXxx strings
+            // pollute the X-pool with garbage before the real X is computed.
+            // Confirmed from device logs: 15/16 pool slots were wasted on these
+            // before the correct X (MD5("ase1junowalletD")) got the last slot.
+            if (len >= 12 &&
+                p[0]=='M' && p[1]=='G' && p[2]=='C' && p[3]=='o' &&
+                p[4]=='p' && p[5]=='y' && p[6]=='A' && p[7]=='n' &&
+                p[8]=='s' && p[9]=='w' && p[10]=='e' && p[11]=='r') {
+                g_md5_in_hook = 0;
+                return ret;
+            }
             static const char _hx[] = "0123456789abcdef";
             char out_hex[33];
             for (int _i=0;_i<16;_i++){out_hex[2*_i]=_hx[md[_i]>>4];out_hex[2*_i+1]=_hx[md[_i]&0xF];}
